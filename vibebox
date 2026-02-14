@@ -1,0 +1,3103 @@
+#!/bin/bash
+
+set -e  # エラーが発生したら即座に終了
+
+# 現在のディレクトリを基準にgitリポジトリのルートを取得
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    PROJECT_ROOT="$(git rev-parse --show-toplevel)"
+else
+    PROJECT_ROOT="$(dirname "${BASH_SOURCE[0]}")"
+fi
+
+# 現在のディレクトリ名を取得してイメージ名を構築
+CURRENT_DIR_NAME="$(basename "$PROJECT_ROOT")"
+IMAGE_NAME="vibebox/${CURRENT_DIR_NAME}"
+TAG="${VIVEBOX_TAG:-latest}"
+BUILD_CONTEXT="$PROJECT_ROOT/.vibebox"
+DOCKERFILE_PATH="$PROJECT_ROOT/.vibebox/Dockerfile"
+DEFAULT_CONTAINER_USERNAME="${VIBEBOX_CONTAINER_USERNAME:-vibebox}"
+
+if command -v envchain >/dev/null 2>&1; then
+    HAS_ENVCHAIN="true"
+else
+    HAS_ENVCHAIN="false"
+fi
+
+docker_cmd() {
+    if [[ "$HAS_ENVCHAIN" == "true" ]]; then
+        envchain "$IMAGE_NAME" docker "$@"
+    else
+        docker "$@"
+    fi
+}
+
+docker_cmd_prefix() {
+    if [[ "$HAS_ENVCHAIN" == "true" ]]; then
+        printf 'envchain %q docker' "$IMAGE_NAME"
+    else
+        printf 'docker'
+    fi
+}
+
+docker_find_running_container_id_by_name() {
+    local expected_container_name="$1"
+    if [[ -z "$expected_container_name" ]]; then
+        return 1
+    fi
+
+    local running_containers
+    running_containers=$(docker_cmd ps --filter "name=vibebox" --format "{{.ID}}\t{{.Names}}" 2>/dev/null || true)
+    if [[ -z "$running_containers" ]]; then
+        return 1
+    fi
+
+    while IFS=$'\t' read -r container_id container_name; do
+        if [[ -n "$container_id" && "$container_name" == "$expected_container_name" ]]; then
+            printf '%s\n' "$container_id"
+            return 0
+        fi
+    done <<< "$running_containers"
+
+    return 1
+}
+
+devcontainer_cmd() {
+    if ! command -v devcontainer &> /dev/null; then
+        echo "エラー: devcontainer CLIがインストールされていません" >&2
+        return 1
+    fi
+
+    if [[ "$HAS_ENVCHAIN" == "true" ]]; then
+        envchain "$IMAGE_NAME" devcontainer "$@"
+    else
+        devcontainer "$@"
+    fi
+}
+
+devcontainer_cmd_prefix() {
+    if [[ "$HAS_ENVCHAIN" == "true" ]]; then
+        printf 'envchain %q devcontainer' "$IMAGE_NAME"
+    else
+        printf 'devcontainer'
+    fi
+}
+
+# AWS関連の環境変数リスト
+AWS_ENV_VARS=(
+    "AWS_ACCESS_KEY_ID"
+    "AWS_SECRET_ACCESS_KEY"
+    "AWS_SESSION_TOKEN"
+    "AWS_DEFAULT_REGION"
+    "AWS_REGION"
+    "AWS_PROFILE"
+    "AWS_CONFIG_FILE"
+    "AWS_SHARED_CREDENTIALS_FILE"
+)
+
+resolve_vibebox_ecr_registry() {
+    printf '%s' "${VIBEBOX_ECR_REGISTRY:-}"
+}
+
+resolve_vibebox_aws_region() {
+    if [[ -n "${VIBEBOX_AWS_REGION:-}" ]]; then
+        printf '%s' "$VIBEBOX_AWS_REGION"
+    elif [[ -n "${AWS_REGION:-}" ]]; then
+        printf '%s' "$AWS_REGION"
+    elif [[ -n "${AWS_DEFAULT_REGION:-}" ]]; then
+        printf '%s' "$AWS_DEFAULT_REGION"
+    fi
+}
+
+escape_sed_replacement() {
+    printf '%s' "$1" | sed -e 's/[\/&|]/\\&/g'
+}
+
+# カレントディレクトリがワークスペース内の場合、ブランチ名を自動取得
+get_current_branch_name() {
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        # clone形式のワークスペースディレクトリかどうかを判定
+        local current_dir
+        current_dir="$(pwd)"
+        local vibebox_workspace_base="$PROJECT_ROOT/.vibebox-workspaces"
+
+        # vibebox-workspaces配下のディレクトリかチェック
+        if [[ "$current_dir" == "$vibebox_workspace_base"* ]]; then
+            # vibebox-workspaces/{branch-name} の部分からブランチ名を抽出
+            local relative_path="${current_dir#$vibebox_workspace_base/}"
+            # サブディレクトリにいる場合は最初の部分がブランチ名
+            echo "${relative_path%%/*}"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# devcontainerを検出する関数
+find_devcontainer() {
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+
+    # devcontainer.{repo-name} のパターンでコンテナを検索
+    local container_id
+    container_id=$(docker_cmd ps --filter "name=vibebox.${git_repo_name}" --format "{{.ID}}" 2>/dev/null | head -1)
+
+    if [[ -n "$container_id" ]]; then
+        echo "$container_id"
+        return 0
+    fi
+
+    # フォールバック: devcontainerで始まるコンテナを検索
+    container_id=$(docker_cmd ps --filter "name=vibebox." --format "{{.ID}}" 2>/dev/null | head -1)
+
+    if [[ -n "$container_id" ]]; then
+        echo "$container_id"
+        return 0
+    fi
+
+    return 1
+}
+
+# devcontainer.jsonからworkspaceFolderを取得する関数
+get_devcontainer_workspace_folder() {
+    local devcontainer_json="$PROJECT_ROOT/.devcontainer/devcontainer.json"
+
+    # devcontainer.jsonが存在するかチェック
+    if [[ ! -f "$devcontainer_json" ]]; then
+        echo '\$HOME'
+        return 0
+    fi
+
+    # workspaceFolderを取得
+    local workspace_folder
+
+    # jqがインストールされている場合
+    if command -v jq &> /dev/null; then
+        workspace_folder=$(sed 's://.*$::g; s:/\*.*\*/::g' "$devcontainer_json" | jq -r '.workspaceFolder // empty' 2>/dev/null)
+    else
+        # jqがない場合はgrepとsedで抽出
+        workspace_folder=$(grep -o '"workspaceFolder"[[:space:]]*:[[:space:]]*"[^"]*"' "$devcontainer_json" 2>/dev/null | sed 's/.*"workspaceFolder"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    fi
+
+    # workspaceFolderが設定されていない場合はデフォルト
+    if [[ -z "$workspace_folder" || "$workspace_folder" == "null" ]]; then
+        echo '\$HOME'
+    else
+        echo "$workspace_folder"
+    fi
+}
+
+# 与えられたパス（シンボリックリンクを含む）を絶対パスに解決する
+resolve_absolute_path() {
+    local path="$1"
+
+    while [[ -L "$path" ]]; do
+        local target
+        target="$(readlink "$path")"
+
+        if [[ "$target" == /* ]]; then
+            path="$target"
+        else
+            path="$(cd "$(dirname "$path")" && pwd -P)/$target"
+        fi
+    done
+
+    path="$(cd "$(dirname "$path")" && pwd -P)/$(basename "$path")"
+    printf '%s\n' "$path"
+}
+
+# ~/.local/bin/vibebox に現在のスクリプトへのsymlinkを作成する
+link_vibebox_command() {
+    local script_path
+    script_path="$(resolve_absolute_path "${BASH_SOURCE[0]}")"
+
+    local link_dir="$HOME/.local/bin"
+    local link_path="$link_dir/vibebox"
+
+    mkdir -p "$link_dir"
+
+    if [[ -L "$link_path" ]]; then
+        local existing_target
+        existing_target="$(resolve_absolute_path "$link_path")"
+
+        if [[ "$existing_target" == "$script_path" ]]; then
+            echo "既に設定済みです: $link_path -> $script_path"
+            return 0
+        fi
+
+        ln -sfn "$script_path" "$link_path"
+        echo "symlinkを更新しました: $link_path -> $script_path"
+    elif [[ -e "$link_path" ]]; then
+        echo "エラー: $link_path は既に存在します（symlinkではありません）" >&2
+        echo "手動で削除またはリネームしてから再実行してください。" >&2
+        return 1
+    else
+        ln -s "$script_path" "$link_path"
+        echo "symlinkを作成しました: $link_path -> $script_path"
+    fi
+
+    case ":$PATH:" in
+        *":$link_dir:"*)
+            ;;
+        *)
+            echo
+            echo "注意: $link_dir が PATH に含まれていません。"
+            echo "必要に応じてシェル設定に次を追加してください:"
+            echo "  export PATH=\"$link_dir:\$PATH\""
+            ;;
+    esac
+}
+
+# 使用方法を表示
+show_usage() {
+    cat << EOF
+Usage: $0 <command> [options]
+
+■ セットアップ
+    init                       .vibeboxディレクトリを初期化（テンプレートファイルを配置）
+    container build [--tag TAG] [--build-arg KEY=VALUE] [--no-cache]
+                               .vibebox/Dockerfileを使ってvibeboxイメージをビルド（レガシー）
+    container tag [--tag TAG]   ローカルのvibeboxイメージにECRタグを付与（レガシー）
+    container push [--tag TAG] ECRにvibeboxイメージをプッシュ（レガシー）
+    doctor                     vibebox環境の健全性をチェック
+
+■ セッション制御
+    list | ls                  ワークスペース一覧を表示（`ws ls` のエイリアス）
+    up <branch-name> [--no-attach]
+                               指定されたブランチでvibeboxコンテナセッションを開始（ワークスペースを自動作成）
+                               devcontainer.jsonのrunArgsにブランチ名を追加して起動
+    down [branch-name] [--rm]
+                               指定されたブランチのvibeboxコンテナセッションを停止（ワークスペースディレクトリ内では省略可）
+                               --rm を指定すると停止後にワークスペースを削除
+    down --all [--rm]          すべてのvibeboxコンテナセッションを停止（--rm指定時はワークスペースも削除）
+
+■ ワークスペースアクセス
+    shell [branch-name]        指定されたブランチのvibeboxコンテナでシェルを起動（ワークスペースディレクトリ内では省略可）
+    edit [branch-name]         指定されたブランチのワークスペースディレクトリをCursorで開く（ワークスペースディレクトリ内では省略可）
+    attach [branch-name]       tmuxセッションにアタッチ（ブランチ名指定で特定ウィンドウへ）
+    cd [branch-name]           ローカルのワークスペースディレクトリをtmuxウィンドウで開く（window名: {branch-name}(local)）
+
+■ ワークスペース管理
+    workspace list             .vibebox-workspaces内のワークスペース一覧を表示
+    ws ls                      workspace listのエイリアス
+    rm [branch-name]           指定ブランチのワークスペースを削除（確認プロンプト有り）
+
+■ メンテナンス
+    cleanup                    すべてのvibeboxワークスペースを削除
+
+■ その他
+    help                       このヘルプを表示
+    link                       ~/.local/bin/vibebox へのsymlinkを作成
+    secrets set               envchainを使ってAWSシークレットを設定
+
+Options:
+    --attach                   セッション開始後にtmuxセッションに自動アタッチ (upのみ)
+    --all                      すべてのセッションを対象にする (downのみ)
+    --rm                       セッション停止後にワークスペースを削除する (downのみ)
+    --tag TAG                  Dockerイメージのタグを指定 (container build/pushのみ)
+    --build-arg KEY=VALUE      Dockerビルド引数を指定 (container buildのみ)
+    --no-cache                 Dockerビルド時にキャッシュを使用しない (container buildのみ)
+
+Requirements:
+    - devcontainer CLI: npm install -g @devcontainers/cli
+    - jq: JSONの解析に必要
+    - tmux: セッション管理に推奨
+
+Environment Variables (optional):
+    - VIBEBOX_ECR_REGISTRY        ECRレジストリ (例: 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com)
+    - VIBEBOX_AWS_REGION          ECRログイン時のリージョン
+    - VIBEBOX_S3_DEV_BUCKET_NAME  Docker build時に渡す任意ビルド引数
+    - VIBEBOX_DEVCONTAINER_IMAGE  init時に生成するdevcontainer image
+    - VIBEBOX_ENVCHAIN_SERVICE    init時に生成するenvchainサービス名
+    - VIBEBOX_CONTAINER_USERNAME  init時に生成するコンテナユーザー名
+EOF
+}
+
+# ビルドコマンド
+build_image() {
+    local tag="$1"
+    local use_aws_env="$2"
+    local no_cache="$3"
+    shift 3
+    local custom_build_args=("$@")
+
+    echo "=== vibebox Dockerイメージをビルド中 ==="
+    echo "イメージ名: ${IMAGE_NAME}:${tag}"
+    echo "ビルドコンテキスト: $BUILD_CONTEXT"
+    echo "Dockerfile: $DOCKERFILE_PATH"
+    echo
+
+    # Dockerfileの存在確認
+    if [[ ! -f "$DOCKERFILE_PATH" ]]; then
+        echo "エラー: Dockerfileが見つかりません: $DOCKERFILE_PATH" >&2
+        exit 1
+    fi
+
+    # ビルド引数を構築
+    local build_args=()
+
+    # 任意のデフォルトビルド引数を追加
+    local default_s3_bucket="${VIBEBOX_S3_DEV_BUCKET_NAME:-}"
+    if [[ -n "$default_s3_bucket" ]]; then
+        build_args+=(--build-arg "VIBEBOX_S3_DEV_BUCKET_NAME=${default_s3_bucket}")
+    fi
+
+    # カスタムビルド引数を追加
+    build_args+=("${custom_build_args[@]}")
+
+    # Docker buildコマンドを実行
+    echo "Docker buildコマンドを実行中..."
+    if [[ ${#build_args[@]} -gt 0 ]]; then
+        echo "ビルド引数:"
+        for arg in "${build_args[@]}"; do
+            if [[ "$arg" == "--build-arg" ]]; then
+                continue
+            fi
+            # センシティブな情報をマスク
+            if [[ "$arg" =~ AWS_ACCESS_KEY_ID=.* ]] || [[ "$arg" =~ AWS_SECRET_ACCESS_KEY=.* ]] || [[ "$arg" =~ AWS_SESSION_TOKEN=.* ]]; then
+                echo "  ${arg%%=*}=***"
+            else
+                echo "  $arg"
+            fi
+        done
+        echo
+    fi
+
+    # --no-cacheオプションの処理
+    local cache_option=()
+    if [[ "$no_cache" == "true" ]]; then
+        cache_option=(--no-cache)
+        echo "注意: キャッシュを使用せずにビルドします"
+        echo
+    fi
+
+    docker_cmd build \
+        --secret id=aws_access_key_id,env=AWS_ACCESS_KEY_ID \
+        --secret id=aws_secret_access_key,env=AWS_SECRET_ACCESS_KEY \
+        --file "$DOCKERFILE_PATH" \
+        --tag "${IMAGE_NAME}:${tag}" \
+        --progress=plain \
+        "${cache_option[@]}" \
+        "${build_args[@]}" \
+        "$BUILD_CONTEXT"
+
+    echo
+    echo "=== ビルド完了 ==="
+    echo "イメージ: ${IMAGE_NAME}:${tag}"
+    echo
+    local docker_prefix
+    docker_prefix=$(docker_cmd_prefix)
+    echo "次のコマンドでコンテナを起動できます:"
+    echo "  ${docker_prefix} run -it --rm ${IMAGE_NAME}:${tag} bash"
+}
+
+# ECRタグ付与処理
+tag_image_core() {
+    local tag="$1"
+    local quiet="${2:-false}"
+
+    local ecr_registry
+    ecr_registry=$(resolve_vibebox_ecr_registry)
+    if [[ -z "$ecr_registry" ]]; then
+        echo "エラー: VIBEBOX_ECR_REGISTRY が設定されていません" >&2
+        echo "例: export VIBEBOX_ECR_REGISTRY=123456789012.dkr.ecr.ap-northeast-1.amazonaws.com" >&2
+        return 1
+    fi
+    local ecr_repository="${IMAGE_NAME}"
+    local ecr_image="${ecr_registry}/${ecr_repository}:${tag}"
+
+    if [[ "$quiet" != "true" ]]; then
+        echo "=== vibebox DockerイメージにECRタグを付与 ==="
+        echo "ローカルイメージ: ${IMAGE_NAME}:${tag}"
+        echo "ECRイメージ: ${ecr_image}"
+        echo
+    fi
+
+    if ! docker_cmd image inspect "${IMAGE_NAME}:${tag}" >/dev/null 2>&1; then
+        echo "エラー: Dockerイメージが見つかりません: ${IMAGE_NAME}:${tag}" >&2
+        echo "まず 'container build' コマンドでイメージをビルドしてください。" >&2
+        return 1
+    fi
+
+    if [[ "$quiet" != "true" ]]; then
+        echo "イメージにECRタグを付けています..."
+    fi
+
+    if ! docker_cmd tag "${IMAGE_NAME}:${tag}" "${ecr_image}"; then
+        echo "エラー: イメージのタグ付けに失敗しました" >&2
+        return 1
+    fi
+
+    if [[ "$quiet" != "true" ]]; then
+        echo "✓ タグ付け完了: ${ecr_image}"
+        echo
+        echo "タグ付けされたイメージをプッシュするには:"
+        echo "  docker push ${ecr_image}"
+    else
+        printf "%s" "$ecr_image"
+    fi
+}
+
+tag_image() {
+    local tag="$1"
+    tag_image_core "$tag"
+}
+
+# container tagコマンド
+container_tag_command() {
+    local custom_tag=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tag)
+                custom_tag="$2"
+                shift 2
+                ;;
+            --help|-h)
+                show_usage
+                exit 0
+                ;;
+            *)
+                echo "エラー: 不明なオプション: $1" >&2
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ -n "$custom_tag" ]]; then
+        TAG="$custom_tag"
+    fi
+
+    tag_image "$TAG"
+}
+
+# pushコマンド
+push_image() {
+    local tag="$1"
+    local ecr_registry
+    ecr_registry=$(resolve_vibebox_ecr_registry)
+    if [[ -z "$ecr_registry" ]]; then
+        echo "エラー: VIBEBOX_ECR_REGISTRY が設定されていません" >&2
+        echo "例: export VIBEBOX_ECR_REGISTRY=123456789012.dkr.ecr.ap-northeast-1.amazonaws.com" >&2
+        exit 1
+    fi
+
+    local aws_region
+    aws_region=$(resolve_vibebox_aws_region)
+    if [[ -z "$aws_region" ]]; then
+        echo "エラー: AWSリージョンが設定されていません" >&2
+        echo "VIBEBOX_AWS_REGION または AWS_REGION を設定してください" >&2
+        exit 1
+    fi
+
+    local ecr_repository="${IMAGE_NAME}"
+
+    echo "=== vibebox DockerイメージをECRにプッシュ ==="
+    echo "ローカルイメージ: ${IMAGE_NAME}:${tag}"
+    echo "ECRイメージ: ${ecr_registry}/${ecr_repository}:${tag}"
+    echo
+
+    # ECRにログイン
+    echo "ECRにログイン中..."
+    if ! aws ecr get-login-password --region "$aws_region" | docker_cmd login --username AWS --password-stdin "${ecr_registry}" 2>/dev/null; then
+        echo "エラー: ECRへのログインに失敗しました" >&2
+        echo "AWS認証情報が正しく設定されているか確認してください。" >&2
+        exit 1
+    fi
+    echo "✓ ECRにログインしました"
+    echo
+
+    echo "イメージにECRタグを付けています..."
+    local tagged_ecr_image
+    if ! tagged_ecr_image=$(tag_image_core "$tag" "true"); then
+        exit 1
+    fi
+    echo "✓ タグ付け完了: ${tagged_ecr_image}"
+    echo
+
+    # ECRにプッシュ
+    echo "イメージをECRにプッシュ中..."
+    if ! docker_cmd push "${tagged_ecr_image}"; then
+        echo "エラー: イメージのプッシュに失敗しました" >&2
+        exit 1
+    fi
+
+    echo
+    echo "=== プッシュ完了 ==="
+    echo "ECRイメージ: ${tagged_ecr_image}"
+    echo
+    echo "プッシュされたイメージを使用するには:"
+    echo "  docker pull ${tagged_ecr_image}"
+}
+
+# ワークスペース削除ヘルパー
+remove_workspace_directory() {
+    local branch_name="$1"
+
+    if [[ -z "$branch_name" ]]; then
+        echo "エラー: ワークスペース削除のブランチ名が指定されていません" >&2
+        return 1
+    fi
+
+    local workspace_path="$PROJECT_ROOT/.vibebox-workspaces/$branch_name"
+
+    if [[ ! -d "$workspace_path" ]]; then
+        echo "ワークスペースは存在しません: $workspace_path"
+        return 0
+    fi
+
+    echo "ワークスペースを削除します: $workspace_path"
+    if rm -rf "$workspace_path"; then
+        echo "✓ ワークスペースを削除しました"
+        rmdir -p "$(dirname "$workspace_path")" 2>/dev/null || true
+
+        local vibebox_dir="$PROJECT_ROOT/.vibebox-workspaces"
+        if [[ -d "$vibebox_dir" ]] && [[ -z "$(ls -A "$vibebox_dir" 2>/dev/null)" ]]; then
+            rmdir "$vibebox_dir" 2>/dev/null || true
+        fi
+    else
+        echo "✗ ワークスペースの削除に失敗しました" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+remove_all_workspaces() {
+    local vibebox_dir="$PROJECT_ROOT/.vibebox-workspaces"
+
+    if [[ ! -d "$vibebox_dir" ]]; then
+        echo "削除対象のワークスペースはありません: $vibebox_dir"
+        return 0
+    fi
+
+    shopt -s nullglob
+    local workspace_paths=("$vibebox_dir"/*)
+    shopt -u nullglob
+
+    if [[ ${#workspace_paths[@]} -eq 0 ]]; then
+        echo "削除対象のワークスペースはありません。"
+        return 0
+    fi
+
+    for workspace_path in "${workspace_paths[@]}"; do
+        if [[ -d "$workspace_path" ]]; then
+            local branch_name="${workspace_path#$vibebox_dir/}"
+            remove_workspace_directory "$branch_name"
+        fi
+    done
+
+    return 0
+}
+
+# stopコマンド（--all用）
+stop_all_sessions() {
+    local remove_workspace_flag="${1:-false}"
+
+    echo "=== すべての devcontainer セッションを停止 ==="
+    echo
+
+    # gitリポジトリ名を取得
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+
+    # 稼働中のdevcontainerコンテナを取得
+    local container_ids
+    container_ids=$(docker_cmd ps --filter "name=vibebox.${git_repo_name}" --format "{{.ID}}" 2>/dev/null)
+
+    if [[ -z "$container_ids" ]]; then
+        echo "現在稼働中のdevcontainerセッションはありません。"
+    else
+        echo "すべてのdevcontainerセッションを停止します..."
+        echo
+
+        local count=0
+        local stopped_branch_names=()
+
+        while IFS= read -r container_id; do
+            if [[ -n "$container_id" ]]; then
+                count=$((count + 1))
+                # コンテナ名を取得
+                local container_name
+                container_name=$(docker_cmd inspect "$container_id" --format '{{.Name}}' 2>/dev/null | sed 's/^\/*//')
+                echo "セッション $container_name を停止中..."
+
+                # ワークスペースパスを特定してdevcontainer downを試行
+                if [[ "$container_name" =~ devcontainer\.${git_repo_name}\.(.+)$ ]]; then
+                    local branch_name="${BASH_REMATCH[1]}"
+                    # ハイフンをスラッシュに戻す
+                    branch_name="${branch_name//-/\/}"
+                    stopped_branch_names+=("$branch_name")
+                    local workspace_path="$PROJECT_ROOT/.vibebox-workspaces/$branch_name"
+
+                    if command -v devcontainer &> /dev/null && [[ -d "$workspace_path" ]]; then
+                if devcontainer_cmd down --workspace-folder "$workspace_path" >/dev/null 2>&1; then
+                            echo "  ✓ 停止完了 (devcontainer down)"
+                        else
+                            # devcontainer downが失敗した場合は直接停止
+                            docker_cmd stop "$container_id" >/dev/null 2>&1
+                            if [[ $? -eq 0 ]]; then
+                                docker_cmd rm "$container_id" >/dev/null 2>&1
+                                if [[ $? -eq 0 ]]; then
+                                    echo "  ✓ 停止・削除完了 (docker stop & rm)"
+                                else
+                                    echo "  ✓ 停止完了、削除失敗 (docker stop)"
+                                fi
+                            else
+                                echo "  ✗ 停止失敗"
+                            fi
+                        fi
+                else
+                        # devcontainer CLIがない場合は直接停止
+                        docker_cmd stop "$container_id" >/dev/null 2>&1
+                        if [[ $? -eq 0 ]]; then
+                            docker_cmd rm "$container_id" >/dev/null 2>&1
+                            if [[ $? -eq 0 ]]; then
+                                echo "  ✓ 停止・削除完了"
+                            else
+                                echo "  ✓ 停止完了、削除失敗"
+                            fi
+                        else
+                            echo "  ✗ 停止失敗"
+                        fi
+                    fi
+                else
+                    # 名前パターンが一致しない場合も停止を試行
+                    docker_cmd stop "$container_id" >/dev/null 2>&1
+                    if [[ $? -eq 0 ]]; then
+                        docker_cmd rm "$container_id" >/dev/null 2>&1
+                        if [[ $? -eq 0 ]]; then
+                            echo "  ✓ 停止・削除完了"
+                        else
+                            echo "  ✓ 停止完了、削除失敗"
+                        fi
+                    else
+                        echo "  ✗ 停止失敗"
+                    fi
+                fi
+            fi
+        done <<< "$container_ids"
+
+        if [[ $count -eq 0 ]]; then
+            echo "停止対象のセッションがありませんでした。"
+        else
+            echo
+            echo "$count 個のセッションを停止しました。"
+        fi
+
+        if [[ "$remove_workspace_flag" == "true" ]]; then
+            echo
+            echo "ワークスペース削除オプションが指定されています。"
+            if [[ ${#stopped_branch_names[@]} -gt 0 ]]; then
+                for branch_name in "${stopped_branch_names[@]}"; do
+                    remove_workspace_directory "$branch_name" || true
+                done
+            fi
+        fi
+    fi
+
+    # tmuxセッションをチェックして削除
+    if command -v tmux &> /dev/null; then
+        local tmux_session="vibebox_${git_repo_name//[.\/-]/_}"
+
+        if tmux has-session -t "$tmux_session" 2>/dev/null; then
+            echo
+            echo "tmuxセッションを削除します: $tmux_session"
+            tmux kill-session -t "$tmux_session" 2>/dev/null
+            if [[ $? -eq 0 ]]; then
+                echo "✓ tmuxセッションを削除しました。"
+            else
+                echo "✗ tmuxセッションの削除に失敗しました。"
+            fi
+        fi
+    fi
+    if [[ "$remove_workspace_flag" == "true" ]]; then
+        echo
+        echo "残りのワークスペースをクリーンアップしています..."
+        remove_all_workspaces
+    fi
+}
+
+# stopコマンド（ブランチ名ベース）
+stop_session() {
+    local branch_name="$1"
+    local remove_workspace_flag="${2:-false}"
+
+    # ブランチ名が省略された場合、カレントディレクトリから自動取得を試行
+    if [[ -z "$branch_name" ]]; then
+        branch_name=$(get_current_branch_name)
+        if [[ -z "$branch_name" ]]; then
+            echo "エラー: ブランチ名が指定されておらず、カレントディレクトリからも自動取得できませんでした" >&2
+            echo "ワークスペースディレクトリ内で実行するか、ブランチ名を明示的に指定してください" >&2
+            exit 1
+        fi
+        echo "カレントディレクトリから自動取得したブランチ名: $branch_name"
+    fi
+
+    echo "=== vibebox セッション停止 ==="
+    echo "ブランチ: $branch_name"
+    echo
+
+    # gitリポジトリかどうかチェック
+    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
+        exit 1
+    fi
+
+    # ワークスペースパスを構築
+    local workspace_path="$PROJECT_ROOT/.vibebox-workspaces/$branch_name"
+
+    # tmuxセッション名とウィンドウ名を構築
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+    local tmux_session="${git_repo_name//[.\/-]/_}/vibebox"
+    local tmux_window="${branch_name//[\/.-]/_}"
+
+    # サニタイズされたブランチ名（スラッシュをハイフンに置換）
+    local sanitized_branch="${branch_name//\//-}"
+    local expected_container_name="vibebox.${git_repo_name}.${sanitized_branch}"
+
+    # コンテナIDを検索
+    local container_id=""
+    container_id="$(docker_find_running_container_id_by_name "$expected_container_name" || true)"
+
+    # セッションが見つからない場合
+    if [[ -z "$container_id" ]]; then
+        echo "エラー: ブランチ '$branch_name' のvibeboxコンテナが起動していません。" >&2
+        echo
+        echo "稼働中のセッション一覧:"
+        list_sessions
+        exit 1
+    fi
+
+    echo "コンテナ名: $expected_container_name"
+    echo "コンテナID: $container_id"
+
+    # devcontainer CLIには停止インターフェースが無いため、直接Dockerで停止
+    echo "Dockerコンテナを停止中..."
+    docker_cmd stop "$container_id" >/dev/null 2>&1
+    if [[ $? -eq 0 ]]; then
+        echo "✓ コンテナを停止しました。"
+
+        # コンテナを削除
+        echo "Dockerコンテナを削除中..."
+        docker_cmd rm "$container_id" >/dev/null 2>&1
+        if [[ $? -eq 0 ]]; then
+            echo "✓ コンテナを削除しました。"
+        else
+            echo "✗ コンテナの削除に失敗しました。"
+        fi
+    else
+        echo "✗ コンテナの停止に失敗しました。"
+        exit 1
+    fi
+
+    # tmuxウィンドウを確認して閉じる
+    if command -v tmux &> /dev/null && tmux has-session -t "$tmux_session" 2>/dev/null; then
+        if tmux list-windows -t "$tmux_session" -F "#{window_name}" | grep -q "^${tmux_window}$"; then
+            echo "tmuxウィンドウを閉じます: $tmux_session:$tmux_window"
+            tmux kill-window -t "$tmux_session:$tmux_window" 2>/dev/null || true
+        fi
+    fi
+
+    if [[ "$remove_workspace_flag" == "true" ]]; then
+        echo
+        echo "--rm が指定されたため、ワークスペースを削除します..."
+        if ! remove_workspace_directory "$branch_name"; then
+            echo "⚠️  ワークスペースの削除に失敗しました" >&2
+            exit 1
+        fi
+    fi
+}
+
+# attachコマンド（ブランチ名ベース）
+attach_session() {
+    local branch_name="$1"
+
+    # ブランチ名が省略された場合、カレントディレクトリから自動取得を試行
+    if [[ -z "$branch_name" ]]; then
+        branch_name=$(get_current_branch_name)
+        if [[ -z "$branch_name" ]]; then
+            echo "エラー: ブランチ名が指定されておらず、カレントディレクトリからも自動取得できませんでした" >&2
+            echo "ワークスペースディレクトリ内で実行するか、ブランチ名を明示的に指定してください" >&2
+            exit 1
+        fi
+        echo "カレントディレクトリから自動取得したブランチ名: $branch_name"
+    fi
+
+    echo "=== vivebox セッションにアタッチ ==="
+    echo "ブランチ: $branch_name"
+
+    # gitリポジトリかどうかチェック
+    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
+        exit 1
+    fi
+
+    # tmuxセッション名を構築
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+    local tmux_session="${git_repo_name//[.\/-]/_}/vibebox"
+
+    # tmuxがインストールされているかチェック
+    if ! command -v tmux &> /dev/null; then
+        echo "エラー: tmuxがインストールされていません。" >&2
+        echo "tmuxをインストールしてから再度実行してください。" >&2
+        exit 1
+    fi
+
+    # tmuxセッションが存在するかチェック
+    if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+        echo "エラー: tmuxセッション '$tmux_session' が存在しません。" >&2
+        echo
+        echo "セッションを開始するには:"
+        echo "  $0 up $branch_name"
+        exit 1
+    fi
+
+    # ブランチ名に対応するtmuxウィンドウ名を構築
+    local tmux_window="${branch_name//[\/.-]/_}"
+
+    # ウィンドウが存在するかチェック
+    if ! tmux list-windows -t "$tmux_session" -F "#{window_name}" | grep -q "^${tmux_window}$"; then
+        echo "エラー: ブランチ '$branch_name' のセッションが起動していません。" >&2
+        echo
+        echo "セッションを開始するには:"
+        echo "  $0 up $branch_name"
+        exit 1
+    fi
+
+    echo "tmuxセッション: $tmux_session"
+    echo "tmuxウィンドウ: $tmux_window"
+    echo "アタッチします..."
+    echo
+
+    # 特定のウィンドウにアタッチ
+    if [[ -n "$TMUX" ]]; then
+        # 既にtmux内にいる場合は、ウィンドウを切り替える
+        tmux switch-client -t "$tmux_session:$tmux_window"
+    else
+        # tmux外からの場合は、セッションにアタッチ
+        tmux attach-session -t "$tmux_session:$tmux_window"
+    fi
+}
+
+# list-workspaceコマンド
+list_workspaces() {
+    echo "=== .vibebox-workspaces ワークスペース一覧 ==="
+    echo
+
+    # gitリポジトリかどうかチェック
+    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
+        exit 1
+    fi
+
+    local vibebox_dir="$PROJECT_ROOT/.vibebox-workspaces"
+
+    # vibebox-workspacesディレクトリが存在するかチェック
+    if [[ ! -d "$vibebox_dir" ]]; then
+        echo "ワークスペースディレクトリが存在しません: $vibebox_dir"
+        echo
+        echo "ワークスペースを作成するには:"
+        echo "  $0 up <branch-name>"
+        return 0
+    fi
+
+    echo "ワークスペースディレクトリ: $vibebox_dir"
+    echo
+
+    # ワークスペース一覧を取得
+    local workspace_count=0
+    local workspaces=()
+
+    for workspace_path in "$vibebox_dir"/*; do
+        if [[ -d "$workspace_path" ]]; then
+            local branch_name
+            branch_name=$(basename "$workspace_path")
+            workspaces+=("$branch_name")
+            workspace_count=$((workspace_count + 1))
+        fi
+    done
+
+    if [[ $workspace_count -eq 0 ]]; then
+        echo "ワークスペースが見つかりませんでした。"
+        echo
+        echo "ワークスペースを作成するには:"
+        echo "  $0 up <branch-name>"
+        return 0
+    fi
+
+    echo "総ワークスペース数: $workspace_count"
+    echo
+    echo "ワークスペース一覧:"
+    echo "────────────────────────────────────────────────────────────"
+
+    # gitリポジトリ名を取得（コンテナ状態チェック用）
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+
+    # ワークスペースを一覧表示
+    for branch_name in "${workspaces[@]}"; do
+        local workspace_path="$vibebox_dir/$branch_name"
+        echo "📁 $branch_name"
+        echo "   パス: $workspace_path"
+
+        # Gitブランチ情報を取得
+        if git -C "$workspace_path" status >/dev/null 2>&1; then
+            local current_branch
+            current_branch=$(git -C "$workspace_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
+            if [[ -n "$current_branch" ]]; then
+                echo "   ブランチ: $current_branch"
+            fi
+
+            # 最後のコミット情報
+            local last_commit
+            last_commit=$(git -C "$workspace_path" log -1 --format="%h %s (%cr)" 2>/dev/null)
+            if [[ -n "$last_commit" ]]; then
+                echo "   最新コミット: $last_commit"
+            fi
+
+            # 未コミットの変更があるかチェック
+            if ! git -C "$workspace_path" diff --quiet 2>/dev/null || ! git -C "$workspace_path" diff --cached --quiet 2>/dev/null; then
+                echo "   ⚠️  未コミットの変更あり"
+            fi
+        else
+            echo "   ⚠️  Gitリポジトリではありません"
+        fi
+
+        # 対応するコンテナが稼働中かチェック
+        local sanitized_branch="${branch_name//\//-}"
+        local expected_container_name="vibebox.${git_repo_name}.${sanitized_branch}"
+        local container_id
+        container_id="$(docker_find_running_container_id_by_name "$expected_container_name" || true)"
+
+        if [[ -n "$container_id" ]]; then
+            echo "   🟢 コンテナ稼働中 ($container_id)"
+        else
+            echo "   ⚪ コンテナ停止中"
+        fi
+
+        # ワークスペースサイズ
+        local size
+        if command -v du &> /dev/null; then
+            size=$(du -sh "$workspace_path" 2>/dev/null | cut -f1)
+            if [[ -n "$size" ]]; then
+                echo "   サイズ: $size"
+            fi
+        fi
+
+        echo
+    done
+
+    echo "════════════════════════════════════════════════════════════"
+    echo
+    echo "コマンド:"
+    echo "  セッション開始: $0 up <branch-name>"
+    echo "  エディタで開く: $0 edit <branch-name>"
+    echo "  シェル起動: $0 shell <branch-name>"
+    echo "  セッション停止: $0 down <branch-name>"
+    echo "  ワークスペース一覧: $0 list"
+}
+
+# list-sessionコマンド
+list_sessions() {
+    echo "=== 稼働中の vibebox コンテナセッション一覧 ==="
+    echo
+
+    # gitリポジトリ名を取得
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+
+    # vibeboxコンテナを検索（リポジトリ名を含むコンテナ）
+    local containers
+    containers=$(docker_cmd ps --filter "name=vibebox.${git_repo_name}" --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.CreatedAt}}\t{{.Image}}" 2>/dev/null)
+
+    if [[ -z "$containers" ]] || [[ "$containers" == "CONTAINER ID"* && $(echo "$containers" | wc -l) -eq 1 ]]; then
+        echo "現在稼働中のvibeboxセッションはありません。"
+        echo
+        echo "新しいセッションを開始するには:"
+        echo "  $0 up <branch-name>"
+        return 0
+    fi
+
+    echo "$containers"
+    echo
+
+    # 各コンテナの詳細情報を表示
+    echo "=== セッション詳細 ==="
+    local container_ids
+    container_ids=$(docker_cmd ps --filter "name=vibebox.${git_repo_name}" --format "{{.ID}}" 2>/dev/null)
+
+    local count=0
+    while IFS= read -r container_id; do
+        if [[ -n "$container_id" ]]; then
+            count=$((count + 1))
+            echo
+            echo "セッション #$count"
+            echo "----------------------------------------"
+
+            # コンテナ名を取得
+            local container_name
+            container_name=$(docker_cmd inspect "$container_id" --format '{{.Name}}' 2>/dev/null | sed 's/^\/*//')
+            echo "  コンテナ名: $container_name"
+            echo "  コンテナID: $container_id"
+
+            # コンテナ名からブランチ名を抽出
+            # パターン: vibebox.{repo-name}.{branch-name}
+            if [[ "$container_name" =~ vibebox\.${git_repo_name}\.(.+)$ ]]; then
+                local branch_name="${BASH_REMATCH[1]}"
+                # ハイフンをスラッシュに戻す（サニタイズの逆）
+                branch_name="${branch_name//-/\/}"
+                echo "  ブランチ: $branch_name"
+
+                # ワークスペースパスを表示
+                local workspace_path="$PROJECT_ROOT/.vibebox-workspaces/$branch_name"
+                if [[ -d "$workspace_path" ]]; then
+                    echo "  Workspace: $workspace_path"
+                fi
+            fi
+
+            # 作成時間を取得
+            local created_at
+            created_at=$(docker_cmd inspect "$container_id" --format '{{.Created}}' 2>/dev/null | sed 's/T/ /' | sed 's/\..*//')
+            if [[ -n "$created_at" ]]; then
+                echo "  開始時間: $created_at"
+            fi
+
+            # イメージタグを取得
+            local image_tag
+            image_tag=$(docker_cmd inspect "$container_id" --format '{{.Config.Image}}' 2>/dev/null)
+            if [[ -n "$image_tag" ]]; then
+                echo "  イメージ: $image_tag"
+            fi
+
+            # tmuxセッション/ウィンドウの状態を確認
+            local tmux_session="vibebox_${git_repo_name//[.\/-]/_}"
+
+            if [[ "$container_name" =~ vibebox\.${git_repo_name}\.(.+)$ ]]; then
+                local sanitized_branch="${BASH_REMATCH[1]}"
+                # ハイフンをアンダースコアに変換（tmuxウィンドウ名用）
+                local tmux_window="${sanitized_branch//-/_}"
+
+                if command -v tmux &> /dev/null && tmux has-session -t "$tmux_session" 2>/dev/null; then
+                    if tmux list-windows -t "$tmux_session" -F "#{window_name}" | grep -q "^${tmux_window}$"; then
+                        echo "  tmuxセッション: アクティブ ($tmux_session:$tmux_window)"
+                    else
+                        echo "  tmuxセッション: 非アクティブ"
+                    fi
+                else
+                    echo "  tmuxセッション: 非アクティブ"
+                fi
+            fi
+
+            # 実行中のプロセスを確認
+            local processes
+            processes=$(docker_cmd exec "$container_id" ps aux 2>/dev/null | grep -E "(node|python|java)" | grep -v grep | head -3)
+            if [[ -n "$processes" ]]; then
+                echo "  実行中のプロセス:"
+                echo "$processes" | while IFS= read -r line; do
+                    # プロセス情報を簡潔に表示
+                    local cmd=$(echo "$line" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i; print ""}' | cut -c1-60)
+                    echo "    $cmd"
+                done
+            fi
+        fi
+    done <<< "$container_ids"
+
+    if [[ $count -eq 0 ]]; then
+        echo "詳細情報を取得できませんでした。"
+    else
+        echo
+        echo "セッションにアタッチするには:"
+        echo "  $0 attach <branch-name>"
+        echo
+        echo "セッションを停止するには:"
+        echo "  $0 down <branch-name>"
+    fi
+}
+
+# start-sessionコマンド
+start_session() {
+    local branch_name="$1"
+    local attach_flag="$2"
+
+    echo "=== vibebox セッションを開始 ==="
+    echo "ブランチ: $branch_name"
+    echo
+
+    # gitリポジトリかどうかチェック
+    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
+        exit 1
+    fi
+
+    # ワークスペースパスを構築
+    local workspace_path="$PROJECT_ROOT/.vibebox-workspaces/$branch_name"
+    echo "Workspace パス: $workspace_path"
+
+    # ワークスペースが既に存在するかチェック
+    if [[ -d "$workspace_path" ]]; then
+        echo "既存のワークスペースを使用します: $workspace_path"
+
+        # ワークスペースの状態確認
+        if ! git -C "$workspace_path" status >/dev/null 2>&1; then
+            echo "警告: ワークスペースが無効な状態です。削除して再作成します。"
+            rm -rf "$workspace_path"
+        else
+            # 現在のブランチを確認
+            local current_branch
+            current_branch=$(git -C "$workspace_path" rev-parse --abbrev-ref HEAD 2>/dev/null)
+            echo "現在のブランチ: $current_branch"
+
+            # 指定されたブランチと異なる場合はチェックアウト
+            if [[ "$current_branch" != "$branch_name" ]]; then
+                echo "ブランチ '$branch_name' にチェックアウト中..."
+                if ! git -C "$workspace_path" checkout "$branch_name" 2>/dev/null; then
+                    echo "警告: ブランチのチェックアウトに失敗しました。fetch してから再試行します。"
+                    git -C "$workspace_path" fetch origin
+                    git -C "$workspace_path" checkout "$branch_name" || {
+                        echo "エラー: ブランチ '$branch_name' にチェックアウトできませんでした" >&2
+                        exit 1
+                    }
+                fi
+            fi
+
+            # 最新の変更を取得
+            echo "最新の変更を取得中..."
+            if ! git -C "$workspace_path" fetch origin; then
+                echo "⚠ 警告: git fetchに失敗しましたが、処理を継続します"
+            else
+                if git -C "$workspace_path" show-ref --verify --quiet "refs/remotes/origin/$branch_name"; then
+                    git -C "$workspace_path" merge "origin/$branch_name" --ff-only 2>/dev/null || {
+                        echo "警告: fast-forward mergeができませんでした。手動でマージが必要かもしれません。"
+                    }
+                fi
+            fi
+        fi
+    fi
+
+    # ワークスペースが存在しない場合は作成
+    if [[ ! -d "$workspace_path" ]]; then
+        echo "Git cloneを実行中..."
+
+        # ワークスペースディレクトリを作成
+        mkdir -p "$(dirname "$workspace_path")"
+
+        # リモートリポジトリのURLを取得
+        local remote_url
+        remote_url=$(git remote get-url origin 2>/dev/null)
+        if [[ -z "$remote_url" ]]; then
+            echo "エラー: originリモートが設定されていません" >&2
+            exit 1
+        fi
+
+        echo "リモートURL: $remote_url"
+        echo "クローン先: $workspace_path"
+
+        # リポジトリをクローン
+        if ! git clone "$remote_url" "$workspace_path"; then
+            echo "エラー: リポジトリのクローンに失敗しました" >&2
+            exit 1
+        fi
+
+        echo "クローンが完了しました: $workspace_path"
+
+        # ブランチをチェックアウト
+        cd "$workspace_path"
+
+        # ブランチが存在するかチェック
+        if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+            echo "既存ブランチ '$branch_name' にチェックアウトします"
+            git checkout "$branch_name" || {
+                echo "エラー: ブランチ '$branch_name' にチェックアウトできませんでした" >&2
+                exit 1
+            }
+        elif git show-ref --verify --quiet "refs/remotes/origin/$branch_name"; then
+            echo "リモートブランチ 'origin/$branch_name' をトラッキングするローカルブランチを作成します"
+            git checkout -b "$branch_name" "origin/$branch_name" || {
+                echo "エラー: ブランチ '$branch_name' の作成に失敗しました" >&2
+                exit 1
+            }
+        else
+            echo "新しいブランチ '$branch_name' を作成します"
+            git checkout -b "$branch_name" || {
+                echo "エラー: ブランチ '$branch_name' の作成に失敗しました" >&2
+                exit 1
+            }
+        fi
+
+        echo "ブランチ '$branch_name' にチェックアウト完了"
+    fi
+
+    # ワークスペースディレクトリの存在確認
+    if [[ ! -d "$workspace_path" ]]; then
+        echo "エラー: ワークスペースディレクトリが存在しません: $workspace_path" >&2
+        exit 1
+    fi
+
+    # devcontainer.jsonを読み込んでvibebox.copyFilesに記載されているファイルをコピー
+    cd "$workspace_path"
+
+    echo "最新の変更を取得中..."
+    if ! git pull origin main; then
+        echo "⚠ 警告: git pull origin mainに失敗しましたが、処理を継続します"
+    fi
+
+    local devcontainer_json=".devcontainer/devcontainer.json"
+    local devcontainer_local_json=".devcontainer/devcontainer.local.json"
+
+    if [[ ! -f "$devcontainer_json" ]]; then
+        echo "エラー: devcontainer.jsonが見つかりません: $devcontainer_json" >&2
+        exit 1
+    fi
+
+    # jqがインストールされているかチェック
+    if ! command -v jq &> /dev/null; then
+        echo "エラー: jqがインストールされていません。jqをインストールしてください。" >&2
+        exit 1
+    fi
+
+    # コメントと末尾のカンマを除去してクリーンなJSONを作成
+    local cleaned_json=$(sed 's://.*$::g; s:/\*.*\*/::g' "$devcontainer_json")
+
+    # vibebox.copyFilesが存在するかチェックして、ファイルをコピー
+    local copy_files=$(echo "$cleaned_json" | jq -r '.vibebox.copyFiles // empty | .[]?' 2>/dev/null)
+
+    echo "$(pwd)"
+    if [[ -n "$copy_files" ]]; then
+        echo "vibebox.copyFilesに記載されているファイルをコピー中..."
+        echo "$copy_files" | while IFS= read -r file_path; do
+            if [[ -n "$file_path" && "$file_path" != "null" ]]; then
+                local source_file="$PROJECT_ROOT/$file_path"
+                local dest_file="$workspace_path/$file_path"
+                local dest_dir=$(dirname "$dest_file")
+
+                if [[ -f "$source_file" ]]; then
+                    echo "  $file_path をコピー中..."
+                    # 必要に応じてディレクトリを作成
+                    mkdir -p "$dest_dir"
+                    cp "$source_file" "$dest_file"
+                    echo "  ✓ $file_path のコピーが完了しました"
+                else
+                    echo "  ⚠ 警告: ファイルが見つかりません: $source_file"
+                fi
+            fi
+        done
+    else
+        echo "vibebox.copyFilesが設定されていません。ファイルのコピーをスキップします。"
+    fi
+
+    echo
+
+    echo "devcontainer.jsonを読み込んでdevcontainer.local.jsonを作成中..."
+
+    # gitリポジトリ名を取得
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+
+    # サニタイズされたブランチ名（スラッシュをハイフンに置換）
+    local sanitized_branch="${branch_name//\//-}"
+
+    # runArgsを更新（--name=vibebox.{repo_name}.{branch_name}の形式で設定）
+    # 互換性のため --env-file 指定は自動で除去する
+    echo "$cleaned_json" | jq --arg repo_name "$git_repo_name" --arg branch "$sanitized_branch" '
+        def strip_env_file_args:
+            reduce .[] as $arg (
+                {skip_next: false, out: []};
+                if .skip_next then
+                    .skip_next = false
+                elif ($arg | test("^--env-file(=|$)")) then
+                    if $arg == "--env-file" then
+                        .skip_next = true
+                    else
+                        .
+                    end
+                else
+                    .out += [$arg]
+                end
+            ) | .out;
+
+        .runArgs = ((.runArgs // []) | strip_env_file_args)
+        |
+        if (.runArgs | map(test("^--name=")) | any) then
+                # --name=が既に存在する場合は置換
+                .runArgs = (.runArgs | map(
+                    if test("^--name=") then
+                        "--name=vibebox." + $repo_name + "." + $branch
+                    else
+                        .
+                    end
+                ))
+        else
+                # --name=が存在しない場合は追加
+                .runArgs = .runArgs + ["--name=vibebox." + $repo_name + "." + $branch]
+        end
+    ' > "$devcontainer_local_json"
+
+    echo "devcontainer.local.jsonを作成しました"
+
+    # 必要なファイルの準備
+    echo "必要なファイルを準備中..."
+
+    # devcontainer CLIがインストールされているかチェック
+    if ! command -v devcontainer &> /dev/null; then
+        echo "エラー: devcontainer CLIがインストールされていません。" >&2
+        echo "以下のコマンドでインストールしてください:" >&2
+        echo "  npm install -g @devcontainers/cli" >&2
+        exit 1
+    fi
+
+    # 既存のコンテナをチェック
+    local expected_container_name="vibebox.${git_repo_name}.${sanitized_branch}"
+
+    echo "既存のvibeboxコンテナをチェック中..."
+    local existing_container_id
+
+    # まず、稼働中のvibeboxコンテナを「想定しているコンテナ名」で厳密に検索する
+    # (ブランチ名だけで検索すると、別リポジトリの同名ブランチのコンテナを誤って再利用してしまう)
+    existing_container_id="$(docker_find_running_container_id_by_name "$expected_container_name" || true)"
+    if [[ -n "$existing_container_id" ]]; then
+        echo "既存の稼働中のvibeboxコンテナが見つかりました: $expected_container_name ($existing_container_id)"
+    fi
+
+            # 名前でマッチしなかった場合、ワークスペースディレクトリがマウントされているものを探す（稼働中のみ）
+    if [[ -z "$existing_container_id" ]]; then
+        local all_running_vibebox_containers
+        all_running_vibebox_containers=$(docker_cmd ps --filter "name=vibebox" --format "{{.ID}}" 2>/dev/null)
+
+        if [[ -n "$all_running_vibebox_containers" ]]; then
+            while IFS= read -r container_id; do
+                if [[ -n "$container_id" ]]; then
+                    # マウント情報を確認
+                    local mount_info
+                    mount_info=$(docker_cmd inspect "$container_id" --format '{{range .Mounts}}{{if eq .Source "'$workspace_path'"}}FOUND{{end}}{{end}}' 2>/dev/null)
+                    if [[ "$mount_info" == "FOUND" ]]; then
+                        existing_container_id="$container_id"
+                        local container_name
+                        container_name=$(docker_cmd inspect "$container_id" --format '{{.Name}}' 2>/dev/null | sed 's/^\/*//')
+                        echo "既存の稼働中のvibeboxコンテナが見つかりました（マウントで検索）: $container_name ($container_id)"
+                        break
+                    fi
+                fi
+            done <<< "$all_running_vibebox_containers"
+        fi
+    fi
+
+    if [[ -n "$existing_container_id" ]]; then
+        # コンテナの状態を再確認
+        local container_state
+        container_state=$(docker_cmd inspect "$existing_container_id" --format '{{.State.Status}}' 2>/dev/null)
+        if [[ "$container_state" == "running" ]]; then
+            local container_name
+            container_name=$(docker_cmd inspect "$existing_container_id" --format '{{.Name}}' 2>/dev/null | sed 's/^\/*//')
+            echo "既存のvibeboxコンテナを使用します: $container_name ($existing_container_id)"
+        else
+            echo "既存のコンテナが稼働していません (状態: $container_state)。新しいコンテナを起動します。"
+            existing_container_id=""
+        fi
+    fi
+
+    if [[ -z "$existing_container_id" ]]; then
+        # 停止中/エラー状態のvibeboxコンテナを削除
+        echo "停止中のvibeboxコンテナをクリーンアップ中..."
+        local stopped_containers
+        stopped_containers=$(docker_cmd ps -a --filter "name=vibebox" --filter "status=exited" --format "{{.ID}}" 2>/dev/null)
+        if [[ -n "$stopped_containers" ]]; then
+            echo "$stopped_containers" | xargs envchain "$IMAGE_NAME" docker rm -f >/dev/null 2>&1 || true
+            echo "✓ 停止中のvibeboxコンテナを削除しました"
+        fi
+
+        # devcontainerを起動
+        echo "vibeboxコンテナを起動中..."
+        echo "実行コマンド: $(devcontainer_cmd_prefix) up --override-config $devcontainer_local_json --workspace-folder ."
+        echo "処理中... (時間がかかる場合があります)"
+        echo
+
+        # devcontainer upコマンドを実行
+        # 出力をリアルタイムで表示しつつ、最後の行（JSONレスポンス）を保存
+        local temp_file=$(mktemp)
+
+        # devcontainer upを実行し、出力を一時ファイルとターミナルの両方に送る
+        if devcontainer_cmd up --override-config "$devcontainer_local_json" --workspace-folder . | tee "$temp_file"; then
+            echo
+            echo "devcontainerが起動しました"
+
+            # 最後のJSONレスポンス行を取得
+            local devcontainer_result
+            devcontainer_result=$(tail -1 "$temp_file")
+
+            # JSONレスポンスからcontainerIdを取得
+            existing_container_id=$(echo "$devcontainer_result" | jq -r '.containerId // empty' 2>/dev/null)
+
+            if [[ -z "$existing_container_id" ]]; then
+                echo "警告: JSONレスポンスからcontainerIdを取得できませんでした" >&2
+                echo "最後の行: $devcontainer_result" >&2
+
+                # フォールバック: 最新のdevcontainerを探す
+                echo "フォールバック: 最新のdevcontainerを検索中..."
+                existing_container_id=$(docker_cmd ps --filter "name=devcontainer" --format "{{.ID}}\t{{.CreatedAt}}" | sort -k2 -r | head -1 | cut -f1)
+
+                if [[ -n "$existing_container_id" ]]; then
+                    echo "最新のdevcontainerを使用します: $existing_container_id"
+                else
+                    echo "エラー: devcontainerが見つかりませんでした" >&2
+                    rm -f "$temp_file"
+                    exit 1
+                fi
+            fi
+        else
+            echo "エラー: devcontainerの起動に失敗しました" >&2
+            rm -f "$temp_file"
+            exit 1
+        fi
+
+        # 一時ファイルをクリーンアップ
+        rm -f "$temp_file"
+    fi
+
+    echo "コンテナID: $existing_container_id"
+    echo
+
+    docker_cmd exec "$existing_container_id" sudo bash -c "echo $branch_name > /var/run/vibebox-current-workspace"
+
+    # tmuxセッション名とウィンドウ名を設定
+    local tmux_session="${git_repo_name//[.\/-]/_}/vibebox"
+    local tmux_window="${branch_name//[\/.-]/_}"
+
+    echo "tmuxセッション: $tmux_session"
+    echo "tmuxウィンドウ: $tmux_window"
+    echo
+
+    # tmuxがインストールされているかチェック
+    if ! command -v tmux &> /dev/null; then
+        echo "警告: tmuxがインストールされていません。通常モードで起動します。"
+        echo "シェルを起動します..."
+        echo "終了するには 'exit' を実行してください。"
+        echo
+
+        # Cursorでワークスペースを開く
+        if command -v cursor &> /dev/null; then
+            echo "Cursorでワークスペースを開いています..."
+            cursor "$workspace_path" &
+        fi
+
+        # devcontainerでシェルを起動
+        docker_cmd exec -it "$existing_container_id" sh -c 'cd /workspace && exec $SHELL'
+        return
+    fi
+
+    # tmuxセッションが存在するかチェック
+    if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+        echo "新しいtmuxセッションを作成します: $tmux_session"
+        # セッションを作成して、最初のウィンドウをconsole（ローカルシェル）として起動
+        tmux new-session -d -s "$tmux_session" -n "console" -c "$PROJECT_ROOT"
+        # ブランチ用の新しいウィンドウを作成
+        echo "ブランチ用のtmuxウィンドウを作成します: $tmux_window"
+        tmux new-window -t "$tmux_session" -n "$tmux_window" -c "$workspace_path"
+    else
+        # セッションは存在するが、ウィンドウが存在するかチェック
+        if tmux list-windows -t "$tmux_session" -F "#{window_name}" | grep -q "^${tmux_window}$"; then
+            echo "既存のtmuxウィンドウが見つかりました: $tmux_session:$tmux_window"
+
+            # --attachフラグが設定されている場合のみアタッチ
+            if [[ "$attach_flag" == "true" ]]; then
+                echo "既存のtmuxウィンドウにアタッチします..."
+                # 既にtmux内にいる場合
+                if [[ -n "$TMUX" ]]; then
+                    tmux switch-client -t "$tmux_session:$tmux_window"
+                else
+                    tmux attach-session -t "$tmux_session:$tmux_window"
+                fi
+            else
+                echo "既存のセッションが見つかりました。アタッチするには以下のコマンドを実行してください:"
+                echo "  $0 attach $branch_name"
+            fi
+            return
+        else
+            echo "新しいtmuxウィンドウを作成します: $tmux_window"
+            tmux new-window -t "$tmux_session" -n "$tmux_window" -c "$workspace_path"
+        fi
+    fi
+
+    # workspaceFolderを取得
+    local workspace_folder
+    workspace_folder=$(get_devcontainer_workspace_folder)
+
+    # workspaceFolderが存在するかdevcontainer内で確認
+    local actual_workspace_folder
+    if [[ "$workspace_folder" == '\$HOME' ]] || docker_cmd exec "$existing_container_id" test -d "$workspace_folder" 2>/dev/null; then
+        actual_workspace_folder="$workspace_folder"
+    else
+        echo "警告: ワークスペースフォルダ '$workspace_folder' が存在しません。ホームディレクトリを使用します。"
+        actual_workspace_folder='\$HOME'
+    fi
+
+    echo "actual_workspace_folder: $actual_workspace_folder"
+
+    # devcontainerでシェルを起動するDockerコマンドを構築
+    local docker_exec_cmd
+    if [[ "$actual_workspace_folder" == '\$HOME' ]]; then
+        docker_exec_cmd="$(docker_cmd_prefix) exec -e TERM=xterm-256color -e COLORTERM=truecolor -it \"$existing_container_id\" bash -c 'cd \$HOME && exec \$SHELL'"
+    else
+        docker_exec_cmd="$(docker_cmd_prefix) exec -e TERM=xterm-256color -e COLORTERM=truecolor -it \"$existing_container_id\" bash -c \"cd $actual_workspace_folder && exec \\\$SHELL\""
+    fi
+
+    # tmuxウィンドウでDockerコマンドを実行
+    tmux send-keys -t "$tmux_session:$tmux_window" "$docker_exec_cmd" Enter
+
+    # Cursorでワークスペースを開く
+    if command -v cursor &> /dev/null; then
+        echo "Cursorでワークスペースを開いています..."
+        cursor "$workspace_path" &
+    fi
+
+    # --attachフラグが設定されている場合のみtmuxセッションにアタッチ
+    if [[ "$attach_flag" == "true" ]]; then
+        echo "tmuxセッションにアタッチしています..."
+        if [[ -n "$TMUX" ]]; then
+            # 既にtmux内にいる場合は、ウィンドウを切り替える
+            tmux switch-client -t "$tmux_session:$tmux_window"
+        else
+            # tmux外からの場合は、セッションにアタッチ
+            tmux attach-session -t "$tmux_session:$tmux_window"
+        fi
+    else
+        echo "セッションが開始されました。アタッチするには以下のコマンドを実行してください:"
+        echo "  $0 attach $branch_name"
+    fi
+}
+
+# shellコマンド
+shell_session() {
+    local branch_name="$1"
+
+    # ブランチ名が省略された場合、カレントディレクトリから自動取得を試行
+    if [[ -z "$branch_name" ]]; then
+        branch_name=$(get_current_branch_name)
+        if [[ -z "$branch_name" ]]; then
+            echo "エラー: ブランチ名が指定されておらず、カレントディレクトリからも自動取得できませんでした" >&2
+            echo "ワークスペースディレクトリ内で実行するか、ブランチ名を明示的に指定してください" >&2
+            exit 1
+        fi
+        echo "カレントディレクトリから自動取得したブランチ名: $branch_name"
+    fi
+
+    echo "=== vibebox のシェルを起動 ==="
+    echo "ブランチ: $branch_name"
+    echo
+
+    # gitリポジトリかどうかチェック
+    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
+        exit 1
+    fi
+
+    # gitリポジトリ名を取得
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+
+    # サニタイズされたブランチ名（スラッシュをハイフンに置換）
+    local sanitized_branch="${branch_name//\//-}"
+    local expected_container_name="vibebox.${git_repo_name}.${sanitized_branch}"
+
+    # コンテナIDを検索
+    local container_id=""
+    container_id="$(docker_find_running_container_id_by_name "$expected_container_name" || true)"
+
+    # コンテナが見つからない場合
+    if [[ -z "$container_id" ]]; then
+        echo "エラー: ブランチ '$branch_name' のvibeboxコンテナが起動していません。" >&2
+        echo
+        echo "セッションを開始するには:"
+        echo "  $0 up $branch_name"
+        exit 1
+    fi
+
+    echo "コンテナ名: $expected_container_name"
+    echo "コンテナID: $container_id"
+    echo "シェルを起動します..."
+    echo "終了するには 'exit' を実行してください。"
+    echo
+
+    # workspaceFolderを取得
+    local workspace_folder
+    workspace_folder=$(get_devcontainer_workspace_folder)
+
+    # workspaceFolderが存在するかvibeboxコンテナ内で確認
+    local actual_workspace_folder
+    if [[ "$workspace_folder" == '\$HOME' ]] || docker_cmd exec "$container_id" test -d "$workspace_folder" 2>/dev/null; then
+        actual_workspace_folder="$workspace_folder"
+    else
+        echo "警告: ワークスペースフォルダ '$workspace_folder' が存在しません。ホームディレクトリを使用します。"
+        actual_workspace_folder='\$HOME'
+    fi
+
+    # シェルを起動
+    if [[ "$actual_workspace_folder" == '\$HOME' ]]; then
+        docker_cmd exec -e TERM=xterm-256color -e COLORTERM=truecolor -it "$container_id" bash -c 'cd $HOME && exec $SHELL'
+    else
+        docker_cmd exec -e TERM=xterm-256color -e COLORTERM=truecolor -it "$container_id" bash -c "cd $actual_workspace_folder && exec \$SHELL"
+    fi
+}
+
+# editコマンド
+edit_session() {
+    local branch_name="$1"
+
+    # ブランチ名が省略された場合、カレントディレクトリから自動取得を試行
+    if [[ -z "$branch_name" ]]; then
+        branch_name=$(get_current_branch_name)
+        if [[ -z "$branch_name" ]]; then
+            echo "エラー: ブランチ名が指定されておらず、カレントディレクトリからも自動取得できませんでした" >&2
+            echo "ワークスペースディレクトリ内で実行するか、ブランチ名を明示的に指定してください" >&2
+            exit 1
+        fi
+        echo "カレントディレクトリから自動取得したブランチ名: $branch_name"
+    fi
+
+    echo "=== ブランチのワークスペースをCursorで開く ==="
+    echo "ブランチ: $branch_name"
+    echo
+
+    # gitリポジトリかどうかチェック
+    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
+        exit 1
+    fi
+
+    # ワークスペースパスを構築
+    local workspace_path="$PROJECT_ROOT/.vibebox-workspaces/$branch_name"
+
+    # ワークスペースが存在するかチェック
+    if [[ ! -d "$workspace_path" ]]; then
+        echo "エラー: ブランチ '$branch_name' のワークスペースが存在しません: $workspace_path" >&2
+        echo
+        echo "ワークスペースを作成するには:"
+        echo "  $0 up $branch_name"
+        exit 1
+    fi
+
+    echo "Workspace パス: $workspace_path"
+
+    # Cursorがインストールされているかチェック
+    if ! command -v cursor &> /dev/null; then
+        echo "エラー: Cursorがインストールされていません。" >&2
+        echo "Cursorをインストールしてから再度実行してください。" >&2
+        exit 1
+    fi
+
+    echo "Cursorでワークスペースを開きます..."
+    echo
+
+    # Cursorでワークスペースディレクトリを開く
+    cursor "$workspace_path"
+
+    echo "Cursorで '$branch_name' ブランチのワークスペースを開きました。"
+}
+
+cd_local_session() {
+    local branch_name="$1"
+
+    if [[ -z "$branch_name" ]]; then
+        branch_name=$(get_current_branch_name)
+        if [[ -z "$branch_name" ]]; then
+            echo "エラー: ブランチ名が指定されておらず、カレントディレクトリからも自動取得できませんでした" >&2
+            echo "ワークスペースディレクトリ内で実行するか、ブランチ名を明示的に指定してください" >&2
+            exit 1
+        fi
+        echo "カレントディレクトリから自動取得したブランチ名: $branch_name"
+    fi
+
+    echo "=== ローカルワークスペースをtmuxで開く ==="
+    echo "ブランチ: $branch_name"
+    echo
+
+    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
+        exit 1
+    fi
+
+    local workspace_path="$PROJECT_ROOT/.vibebox-workspaces/$branch_name"
+    if [[ ! -d "$workspace_path" ]]; then
+        echo "エラー: ブランチ '$branch_name' のワークスペースが存在しません: $workspace_path" >&2
+        echo "  ワークスペースを作成するには: $0 up $branch_name" >&2
+        exit 1
+    fi
+    echo "Workspace パス: $workspace_path"
+    echo
+
+    if ! command -v tmux &> /dev/null; then
+        echo "エラー: tmuxがインストールされていません。" >&2
+        echo "tmuxをインストールしてから再度実行してください。" >&2
+        exit 1
+    fi
+
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+    local tmux_session="${git_repo_name//[.\/-]/_}/vibebox"
+    local tmux_window="${branch_name//[\/.-]/_}(local)"
+
+    if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+        echo "tmuxセッションを作成します: $tmux_session"
+        tmux new-session -d -s "$tmux_session" -n "console" -c "$PROJECT_ROOT"
+    fi
+
+    if tmux list-windows -t "$tmux_session" -F "#{window_name}" | grep -Fxq "$tmux_window"; then
+        echo "既存のtmuxウィンドウを使用します: $tmux_session:$tmux_window"
+        tmux send-keys -t "$tmux_session:$tmux_window" "cd $workspace_path" Enter
+    else
+        echo "tmuxウィンドウを作成します: $tmux_session:$tmux_window"
+        tmux new-window -t "$tmux_session" -n "$tmux_window" -c "$workspace_path"
+    fi
+
+    echo
+    echo "tmuxセッションに移動します..."
+    if [[ -n "$TMUX" ]]; then
+        tmux switch-client -t "$tmux_session:$tmux_window"
+    else
+        tmux attach-session -t "$tmux_session:$tmux_window"
+    fi
+}
+
+# secrets setコマンド
+secrets_set() {
+    echo "=== vibebox AWSシークレット設定 ==="
+    echo
+
+    if ! command -v envchain &> /dev/null; then
+        echo "エラー: envchain が見つかりません。brew install envchain などでインストールしてください。" >&2
+        exit 1
+    fi
+
+    local envchain_service="$IMAGE_NAME"
+
+    echo "envchainサービス名: $envchain_service"
+    echo "設定対象: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION, AWS_REGION"
+    echo "プロンプトに従って値を入力してください (空欄のままEnterでスキップ)"
+    echo
+
+    if envchain --set "$envchain_service" \
+        AWS_ACCESS_KEY_ID \
+        AWS_SECRET_ACCESS_KEY \
+        AWS_DEFAULT_REGION \
+        AWS_REGION; then
+        echo
+        echo "✓ シークレットの設定が完了しました"
+    else
+        echo
+        echo "✗ シークレットの設定に失敗しました" >&2
+        exit 1
+    fi
+}
+
+# initコマンド
+init_vibebox() {
+    echo "=== vibebox を初期化 ==="
+    echo
+
+    # 現在のディレクトリを取得
+    local target_dir="$(pwd)"
+    local target_vibebox_dir="$target_dir/.vibebox"
+
+    # スクリプトのディレクトリからテンプレートファイルの場所を特定
+    local script_path
+    script_path="$(resolve_absolute_path "${BASH_SOURCE[0]}")"
+    local script_dir="$(dirname "$script_path")"
+    local template_dir="$script_dir/.vibebox"
+
+    # テンプレートディレクトリの存在確認
+    if [[ ! -d "$template_dir" ]]; then
+        echo "エラー: テンプレートディレクトリが見つかりません: $template_dir" >&2
+        exit 1
+    fi
+
+    # 必要なテンプレートファイルの存在確認
+    if [[ ! -f "$template_dir/claude-pty" ]]; then
+        echo "エラー: claude-ptyテンプレートが見つかりません: $template_dir/claude-pty" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$template_dir/Dockerfile.template" ]]; then
+        echo "エラー: Dockerfile.templateが見つかりません: $template_dir/Dockerfile.template" >&2
+        exit 1
+    fi
+
+    # .vibeboxディレクトリが既に存在するかチェック
+    if [[ -d "$target_vibebox_dir" ]]; then
+        echo "警告: .vibeboxディレクトリが既に存在します: $target_vibebox_dir"
+        read -p "既存のディレクトリを上書きしますか？ (y/N): " -r
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "初期化を中止しました。"
+            exit 0
+        fi
+    fi
+
+    # .vibeboxディレクトリを作成
+    echo "ディレクトリを作成: $target_vibebox_dir"
+    mkdir -p "$target_vibebox_dir"
+
+    # claude-ptyをコピー
+    echo "ファイルをコピー: claude-pty"
+    cp "$template_dir/claude-pty" "$target_vibebox_dir/claude-pty"
+    chmod +x "$target_vibebox_dir/claude-pty"
+
+    # BASE_IMAGEの入力を求める
+    echo
+    echo "ベースイメージを指定してください。"
+    echo "例:"
+    echo "  - ubuntu:22.04"
+    echo "  - python:3.11-slim"
+    echo "  - node:20-alpine"
+    echo
+    read -p "BASE_IMAGE [ubuntu:22.04]: " base_image
+
+    # デフォルト値の設定
+    if [[ -z "$base_image" ]]; then
+        base_image="ubuntu:22.04"
+    fi
+
+    echo
+    echo "ベースイメージ: $base_image"
+
+    # カレントディレクトリ名を取得
+    local repo_name="$(basename "$target_dir")"
+
+    local container_username
+    read -p "コンテナ内ユーザー名 [${DEFAULT_CONTAINER_USERNAME}]: " container_username
+    if [[ -z "$container_username" ]]; then
+        container_username="$DEFAULT_CONTAINER_USERNAME"
+    fi
+
+    local default_devcontainer_image="${VIBEBOX_DEVCONTAINER_IMAGE:-vibebox/${repo_name}:latest}"
+    local devcontainer_image
+    read -p "devcontainer image [$default_devcontainer_image]: " devcontainer_image
+    if [[ -z "$devcontainer_image" ]]; then
+        devcontainer_image="$default_devcontainer_image"
+    fi
+
+    local default_envchain_service="${VIBEBOX_ENVCHAIN_SERVICE:-vibebox:${repo_name}:ecr}"
+    local envchain_service
+    read -p "envchain service [$default_envchain_service]: " envchain_service
+    if [[ -z "$envchain_service" ]]; then
+        envchain_service="$default_envchain_service"
+    fi
+
+    # Dockerfile.templateをコピーしてプレースホルダを置換
+    echo "ファイルを作成: Dockerfile"
+    local escaped_base_image
+    local escaped_container_username
+    escaped_base_image=$(escape_sed_replacement "$base_image")
+    escaped_container_username=$(escape_sed_replacement "$container_username")
+    sed \
+        -e "s|{BASE_IMAGE}|$escaped_base_image|g" \
+        -e "s|{USERNAME}|$escaped_container_username|g" \
+        "$template_dir/Dockerfile.template" > "$target_vibebox_dir/Dockerfile"
+
+    # .devcontainerディレクトリを作成
+    mkdir -p "$target_dir/.devcontainer"
+
+    # .devcontainerファイルのコピー
+    if [[ -f "$template_dir/.devcontainer/devcontainer.json" ]]; then
+        echo "ファイルを作成: .devcontainer/devcontainer.json"
+        local escaped_repo_name
+        local escaped_devcontainer_image
+        local escaped_envchain_service
+        escaped_repo_name=$(escape_sed_replacement "$repo_name")
+        escaped_devcontainer_image=$(escape_sed_replacement "$devcontainer_image")
+        escaped_envchain_service=$(escape_sed_replacement "$envchain_service")
+        sed \
+            -e "s|{REPO_NAME}|$escaped_repo_name|g" \
+            -e "s|{USERNAME}|$escaped_container_username|g" \
+            -e "s|{DEVCONTAINER_IMAGE}|$escaped_devcontainer_image|g" \
+            -e "s|{ENVCHAIN_SERVICE}|$escaped_envchain_service|g" \
+            "$template_dir/.devcontainer/devcontainer.json" > "$target_dir/.devcontainer/devcontainer.json"
+    fi
+
+    if [[ -f "$template_dir/.devcontainer/hooks-post-start.sh" ]]; then
+        echo "ファイルをコピー: .devcontainer/hooks-post-start.sh"
+        cp "$template_dir/.devcontainer/hooks-post-start.sh" "$target_dir/.devcontainer/hooks-post-start.sh"
+        chmod +x "$target_dir/.devcontainer/hooks-post-start.sh"
+    fi
+
+    if [[ -f "$template_dir/.devcontainer/ecr-login.sh" ]]; then
+        echo "ファイルをコピー: .devcontainer/ecr-login.sh"
+        cp "$template_dir/.devcontainer/ecr-login.sh" "$target_dir/.devcontainer/ecr-login.sh"
+        chmod +x "$target_dir/.devcontainer/ecr-login.sh"
+    fi
+
+    echo
+    echo "=== 初期化完了 ==="
+    echo ".vibeboxディレクトリが作成されました: $target_vibebox_dir"
+    echo
+    echo "次のステップ:"
+    echo "1. 必要に応じて $target_vibebox_dir/Dockerfile を編集してください"
+    echo "2. 'vibebox container build' でDockerイメージをビルドしてください"
+    echo "3. 'vibebox up <branch-name>' でセッションを開始してください"
+}
+
+# cleanupコマンド
+cleanup_worktrees() {
+    echo "=== vibeboxワークスペースを削除 ==="
+    echo
+
+    # gitリポジトリかどうかチェック
+    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
+        exit 1
+    fi
+
+    local vibebox_dir="$PROJECT_ROOT/.vibebox-workspaces"
+
+    # vibebox-workspacesディレクトリが存在するかチェック
+    if [[ ! -d "$vibebox_dir" ]]; then
+        echo "削除対象のvibeboxワークスペースは見つかりませんでした。"
+        echo "ディレクトリ: $vibebox_dir"
+        return 0
+    fi
+
+    echo "vibeboxディレクトリ: $vibebox_dir"
+    echo
+
+    local vibebox_container_name="vibebox.${git_repo_name}"
+
+    # 稼働中のセッションをチェック
+    local running_sessions
+    running_sessions=$(docker_cmd ps --filter "name=${vibebox_container_name}" --format "{{.ID}}" 2>/dev/null)
+
+    if [[ -n "$running_sessions" ]]; then
+        echo "⚠️  警告: 以下のvibeboxセッションが稼働中です："
+        echo
+
+        # 各コンテナの詳細を表示
+        while IFS= read -r container_id; do
+            if [[ -n "$container_id" ]]; then
+                # マウント情報を取得してブランチ名を抽出
+                local mount_info branch_name
+                local all_mounts
+                all_mounts=$(docker_cmd inspect "$container_id" --format '{{range .Mounts}}{{printf "%s:%s\n" .Source .Destination}}{{end}}' 2>/dev/null)
+                mount_info=$(echo "$all_mounts" | grep -E ":(/workspace|/home/[^/]+/workspace)/" | head -1)
+
+                if [[ -n "$mount_info" ]]; then
+                    local source_path="${mount_info%%:*}"
+                    local dest_path="${mount_info##*:}"
+
+                    if [[ "$dest_path" =~ ^/workspace/(.+)$ ]]; then
+                        branch_name="${BASH_REMATCH[1]}"
+                        echo "  - ブランチ: $branch_name (コンテナID: $container_id)"
+                    elif [[ "$dest_path" =~ ^/home/[^/]+/workspace/(.+)$ ]]; then
+                        branch_name="${BASH_REMATCH[1]}"
+                        echo "  - ブランチ: $branch_name (コンテナID: $container_id)"
+                    fi
+                fi
+            fi
+        done <<< "$running_sessions"
+
+        echo
+        echo "セッションを停止してから再度実行してください："
+        echo "  $0 down --all"
+        echo
+        read -p "稼働中のセッションを無視して続行しますか？ (y/N): " -r
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "クリーンアップを中止しました。"
+            exit 1
+        fi
+        echo
+    fi
+
+    # 既存のワークスペースを一覧表示
+    echo "削除対象のワークスペース："
+    local workspace_count=0
+    if [[ -d "$vibebox_dir" ]]; then
+        for workspace_path in "$vibebox_dir"/*; do
+            if [[ -d "$workspace_path" ]]; then
+                local branch_name
+                branch_name=$(basename "$workspace_path")
+                echo "  - $branch_name ($workspace_path)"
+                workspace_count=$((workspace_count + 1))
+            fi
+        done
+    fi
+
+    if [[ $workspace_count -eq 0 ]]; then
+        echo "  削除対象のワークスペースがありません。"
+        return 0
+    fi
+
+    echo
+    echo "合計 $workspace_count 個のワークスペースが削除されます。"
+    echo
+
+    # 確認プロンプト
+    read -p "本当にすべてのvibeboxワークスペースを削除しますか？ (y/N): " -r
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "クリーンアップを中止しました。"
+        exit 0
+    fi
+
+    echo
+    echo "ワークスペースを削除中..."
+
+    # cloneされたワークスペースを削除
+    local removed_count=0
+    local error_count=0
+
+    for workspace_path in "$vibebox_dir"/*; do
+        if [[ -d "$workspace_path" ]]; then
+            local branch_name
+            branch_name=$(basename "$workspace_path")
+
+            echo "  削除中: $branch_name"
+
+            # ワークスペースディレクトリを直接削除
+            if rm -rf "$workspace_path" 2>/dev/null; then
+                echo "    ✓ ワークスペースを削除しました"
+                removed_count=$((removed_count + 1))
+            else
+                echo "    ✗ ワークスペースの削除に失敗しました"
+                error_count=$((error_count + 1))
+            fi
+        fi
+    done
+
+    # vibebox-workspacesディレクトリ自体が空になった場合は削除
+    if [[ -d "$vibebox_dir" ]] && [[ -z "$(ls -A "$vibebox_dir" 2>/dev/null)" ]]; then
+        echo "  空のvibeboxディレクトリを削除: $vibebox_dir"
+        rmdir "$vibebox_dir" 2>/dev/null || true
+    fi
+
+    echo
+    echo "=== クリーンアップ完了 ==="
+    echo "削除されたワークスペース: $removed_count 個"
+    if [[ $error_count -gt 0 ]]; then
+        echo "削除に失敗したワークスペース: $error_count 個"
+    fi
+
+    echo
+    echo "すべてのvibeboxワークスペースの削除が完了しました。"
+}
+
+# rmコマンド - 単一ワークスペースの削除
+remove_workspace() {
+    echo "=== vibeboxワークスペースを削除 ==="
+    local branch_name="$1"
+
+    # ブランチ名が省略された場合、カレントディレクトリから自動取得を試行
+    if [[ -z "$branch_name" ]]; then
+        branch_name=$(get_current_branch_name)
+        if [[ -z "$branch_name" ]]; then
+            echo "エラー: ブランチ名が指定されておらず、カレントディレクトリからも自動取得できませんでした" >&2
+            echo "ワークスペースディレクトリ内で実行するか、ブランチ名を明示的に指定してください" >&2
+            exit 1
+        fi
+        echo "カレントディレクトリから自動取得したブランチ名: $branch_name"
+    fi
+
+    # gitリポジトリかどうかチェック
+    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
+        exit 1
+    fi
+
+    local workspace_path="$PROJECT_ROOT/.vibebox-workspaces/$branch_name"
+    if [[ ! -d "$workspace_path" ]]; then
+        echo "エラー: ワークスペースが見つかりません: $workspace_path" >&2
+        exit 1
+    fi
+
+    echo "対象ワークスペース: $workspace_path"
+
+    # 対応するコンテナが稼働中かチェック
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+    local sanitized_branch="${branch_name//\//-}"
+    local expected_container_name="vibebox.${git_repo_name}.${sanitized_branch}"
+    local container_id
+    container_id="$(docker_find_running_container_id_by_name "$expected_container_name" || true)"
+
+    if [[ -n "$container_id" ]]; then
+        echo "⚠️  ブランチ '$branch_name' のvibeboxコンテナが稼働中です: $expected_container_name ($container_id)"
+        echo "  先にセッションを停止するには: $0 down $branch_name"
+    fi
+
+    # 確認プロンプト
+    read -p "本当にワークスペース '$branch_name' を削除しますか？ (y/N): " -r
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "削除を中止しました。"
+        exit 0
+    fi
+
+    # 稼働中のコンテナがある場合の追加確認
+    if [[ -n "$container_id" ]]; then
+        read -p "コンテナを停止せずに削除を続行しますか？ (y/N): " -r
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "削除を中止しました。"
+            exit 1
+        fi
+    fi
+
+    if remove_workspace_directory "$branch_name"; then
+        return 0
+    else
+        exit 1
+    fi
+}
+
+# doctor コマンド - 環境チェック
+doctor_check() {
+    echo "=== vibebox 環境診断 ==="
+    echo
+
+    local overall_status="OK"
+    local warning_count=0
+    local error_count=0
+
+    # チェック結果を記録するための関数
+    log_check() {
+        local status="$1"
+        local message="$2"
+        local details="$3"
+
+        case "$status" in
+            "OK")
+                echo "✓ $message"
+                ;;
+            "WARNING")
+                echo "⚠️  $message"
+                warning_count=$((warning_count + 1))
+                if [[ "$overall_status" == "OK" ]]; then
+                    overall_status="WARNING"
+                fi
+                ;;
+            "ERROR")
+                echo "✗ $message"
+                error_count=$((error_count + 1))
+                overall_status="ERROR"
+                ;;
+        esac
+
+        if [[ -n "$details" ]]; then
+            echo "   $details"
+        fi
+    }
+
+    echo "■ 基本環境チェック"
+    echo
+
+    # gitリポジトリチェック
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        log_check "OK" "Gitリポジトリ"
+
+        # リモートoriginの存在チェック
+        if git remote get-url origin >/dev/null 2>&1; then
+            local remote_url
+            remote_url=$(git remote get-url origin)
+            log_check "OK" "Gitリモート (origin): $remote_url"
+        else
+            log_check "ERROR" "Gitリモート (origin) が設定されていません"
+            echo "   git remote add origin <repository-url> で設定してください"
+        fi
+    else
+        log_check "ERROR" "カレントディレクトリがGitリポジトリではありません"
+        echo "   git init でリポジトリを初期化するか、Gitリポジトリ内で実行してください"
+    fi
+
+    # プロジェクトルートの確認
+    if [[ -n "$PROJECT_ROOT" ]]; then
+        log_check "OK" "プロジェクトルート: $PROJECT_ROOT"
+    else
+        log_check "ERROR" "プロジェクトルートを特定できません"
+    fi
+
+    echo
+    echo "■ vibebox 設定チェック"
+    echo
+
+    # .vibeboxディレクトリ
+    if [[ -d "$PROJECT_ROOT/.vibebox" ]]; then
+        log_check "OK" ".vibeboxディレクトリ"
+
+        # Dockerfile
+        if [[ -f "$PROJECT_ROOT/.vibebox/Dockerfile" ]]; then
+            log_check "OK" "Dockerfile"
+        else
+            log_check "ERROR" "Dockerfileが見つかりません"
+            echo "   'vibebox init' でセットアップするか、手動で作成してください"
+        fi
+    else
+        log_check "ERROR" ".vibeboxディレクトリが存在しません"
+        echo "   'vibebox init' を実行してセットアップしてください"
+    fi
+
+    # .devcontainerディレクトリ
+    if [[ -d "$PROJECT_ROOT/.devcontainer" ]]; then
+        log_check "OK" ".devcontainerディレクトリ"
+
+        # devcontainer.json
+        if [[ -f "$PROJECT_ROOT/.devcontainer/devcontainer.json" ]]; then
+            log_check "OK" "devcontainer.json"
+
+                                    # JSONファイルの妥当性チェック（JSONC対応）
+            if command -v jq &> /dev/null; then
+                # コメント、末尾のカンマを除去してクリーンなJSONを作成
+                local cleaned_json
+                cleaned_json=$(sed 's://.*$::g; s:/\*.*\*/::g' "$PROJECT_ROOT/.devcontainer/devcontainer.json" | \
+                              sed 's/,\s*\]/]/g; s/,\s*}/}/g' 2>/dev/null)
+
+                if [[ -n "$cleaned_json" ]] && echo "$cleaned_json" | jq . >/dev/null 2>&1; then
+                    log_check "OK" "devcontainer.json 構文チェック（JSONC対応）"
+
+                    # devcontainer.jsonの内容を詳細チェック
+                    echo
+                    echo "  ● devcontainer.json 詳細設定チェック"
+
+                    # Claude関連ファイルのマウントチェック
+                    local claude_mount_count=0
+                    if echo "$cleaned_json" | jq -r '.mounts[]?' 2>/dev/null | grep -q "\.claude,target="; then
+                        log_check "OK" "  Claude設定ディレクトリマウント (.claude)"
+                        claude_mount_count=$((claude_mount_count + 1))
+                    else
+                        log_check "WARNING" "  Claude設定ディレクトリマウントが見つかりません (.claude)"
+                    fi
+
+                    if echo "$cleaned_json" | jq -r '.mounts[]?' 2>/dev/null | grep -q "\.claude\.json,target="; then
+                        log_check "OK" "  Claude設定ファイルマウント (.claude.json)"
+                        claude_mount_count=$((claude_mount_count + 1))
+                    else
+                        log_check "WARNING" "  Claude設定ファイルマウントが見つかりません (.claude.json)"
+                    fi
+
+                    # GitHub認証情報のマウントチェック
+                    if echo "$cleaned_json" | jq -r '.mounts[]?' 2>/dev/null | grep -q "devcontainer-gh-config"; then
+                        log_check "OK" "  GitHub認証情報マウント (gh config)"
+                    else
+                        log_check "WARNING" "  GitHub認証情報マウントが見つかりません"
+                        echo "     source=devcontainer-gh-config-\${localEnv:USER} の設定を確認してください"
+                    fi
+
+                    # zsh_historyのマウントチェック
+                    if echo "$cleaned_json" | jq -r '.mounts[]?' 2>/dev/null | grep -q "\.zsh_history"; then
+                        log_check "OK" "  zsh履歴ファイルマウント (.zsh_history)"
+                    else
+                        log_check "WARNING" "  zsh履歴ファイルマウントが見つかりません"
+                        echo "     .devcontainer/.zsh_history のマウント設定を確認してください"
+                    fi
+
+                    # ワークスペースディレクトリチェック
+                    local workspace_folder
+                    workspace_folder=$(echo "$cleaned_json" | jq -r '.workspaceFolder // empty' 2>/dev/null)
+                    if [[ "$workspace_folder" == "/workspace" ]]; then
+                        log_check "OK" "  ワークスペースディレクトリ: $workspace_folder"
+                    else
+                        log_check "WARNING" "  ワークスペースディレクトリが /workspace ではありません: $workspace_folder"
+                        echo "     workspaceFolder を /workspace に設定することを推奨します"
+                    fi
+
+                    # Dockerイメージチェック
+                    local image_name
+                    image_name=$(echo "$cleaned_json" | jq -r '.image // empty' 2>/dev/null)
+                    if [[ "$image_name" =~ vibebox ]]; then
+                        log_check "OK" "  Dockerイメージ: vibebox由来 ($image_name)"
+                    else
+                        log_check "WARNING" "  Dockerイメージがvibebox由来ではありません: $image_name"
+                        echo "     振り返りイメージにvibeboxが含まれることを推奨します"
+                    fi
+
+                    # initializeCommandチェック
+                    local initialize_command
+                    initialize_command=$(echo "$cleaned_json" | jq -r '.initializeCommand[]? // empty' 2>/dev/null | tr '\n' ' ')
+                    if [[ -n "$initialize_command" ]]; then
+                        log_check "OK" "  initializeCommand設定あり"
+
+                        # GitHub userの出力チェック
+                        if echo "$initialize_command" | grep -q "gh api user.*\.github-user"; then
+                            log_check "OK" "    GitHub user情報の取得設定"
+                        else
+                            log_check "WARNING" "    GitHub user情報の取得設定が見つかりません"
+                            echo "       'gh api user -q .login > .devcontainer/.github-user' の設定を確認してください"
+                        fi
+
+                        # .zsh_historyファイル作成チェック
+                        if echo "$initialize_command" | grep -q "touch.*\.zsh_history"; then
+                            log_check "OK" "    zsh履歴ファイル作成設定"
+                        else
+                            log_check "WARNING" "    zsh履歴ファイル作成設定が見つかりません"
+                            echo "       'touch .devcontainer/.zsh_history' の設定を確認してください"
+                        fi
+                    else
+                        log_check "WARNING" "  initializeCommandが設定されていません"
+                        echo "     GitHub認証とzsh履歴ファイルの初期化設定を推奨します"
+                    fi
+
+                    # postStartCommandチェック
+                    local post_start_command
+                    post_start_command=$(echo "$cleaned_json" | jq -r '.postStartCommand // empty' 2>/dev/null)
+                    if [[ -n "$post_start_command" ]]; then
+                        log_check "OK" "  postStartCommand設定あり"
+
+                        # hooks-post-start.shの実行チェック
+                        if echo "$post_start_command" | grep -q "hooks-post-start\.sh"; then
+                            log_check "OK" "    hooks-post-start.sh実行設定"
+                        else
+                            log_check "WARNING" "    hooks-post-start.sh実行設定が見つかりません"
+                            echo "       hooks-post-start.shの実行設定を確認してください"
+                        fi
+                    else
+                        log_check "WARNING" "  postStartCommandが設定されていません"
+                        echo "     hooks-post-start.shの実行設定を推奨します"
+                    fi
+
+                    # remoteUserチェック
+                    local remote_user
+                    remote_user=$(echo "$cleaned_json" | jq -r '.remoteUser // empty' 2>/dev/null)
+                    if [[ -n "$remote_user" ]]; then
+                        log_check "OK" "  リモートユーザー: $remote_user"
+                    else
+                        log_check "WARNING" "  リモートユーザーが設定されていません"
+                    fi
+
+                else
+                    log_check "WARNING" "devcontainer.json の構文チェックに失敗しました"
+                    echo "   JSONCファイル（コメント付きJSON）として処理されますが、構文に問題がある可能性があります"
+                fi
+            else
+                log_check "WARNING" "jqがインストールされていないため、JSON構文チェックをスキップ"
+            fi
+        else
+            log_check "ERROR" "devcontainer.jsonが見つかりません"
+            echo "   'vibebox init' でセットアップするか、手動で作成してください"
+        fi
+
+        # 推奨スクリプトファイル
+        local optional_scripts=(
+            "hooks-post-start.sh"
+            "ecr-login.sh"
+        )
+
+        for script in "${optional_scripts[@]}"; do
+            if [[ -f "$PROJECT_ROOT/.devcontainer/$script" ]]; then
+                log_check "OK" "devcontainerスクリプト: $script"
+
+                # 実行権限チェック
+                if [[ -x "$PROJECT_ROOT/.devcontainer/$script" ]]; then
+                    log_check "OK" "実行権限: $script"
+                else
+                    log_check "WARNING" "実行権限がありません: $script"
+                    echo "   chmod +x .devcontainer/$script で権限を付与してください"
+                fi
+            else
+                log_check "WARNING" "推奨スクリプトが見つかりません: $script"
+                echo "   このファイルは初期化処理で使用されます"
+            fi
+        done
+
+    else
+        log_check "ERROR" ".devcontainerディレクトリが存在しません"
+        echo "   'vibebox init' を実行してセットアップしてください"
+    fi
+
+    echo
+    echo "■ 依存ツールチェック"
+    echo
+
+    # Docker
+    if command -v docker &> /dev/null; then
+        if docker info >/dev/null 2>&1; then
+            local docker_version
+            docker_version=$(docker --version | grep -o 'Docker version [0-9.]*' | cut -d' ' -f3)
+            log_check "OK" "Docker ($docker_version) - 稼働中"
+        else
+            log_check "ERROR" "Dockerがインストールされていますが、稼働していません"
+            echo "   Docker Desktopを起動するか、Dockerデーモンを開始してください"
+        fi
+    else
+        log_check "ERROR" "Dockerがインストールされていません"
+        echo "   https://www.docker.com/get-started からDockerをインストールしてください"
+    fi
+
+    # devcontainer CLI
+    if command -v devcontainer &> /dev/null; then
+        local devcontainer_version
+        devcontainer_version=$(devcontainer --version 2>/dev/null | head -1)
+        log_check "OK" "devcontainer CLI ($devcontainer_version)"
+    else
+        log_check "ERROR" "devcontainer CLIがインストールされていません"
+        echo "   npm install -g @devcontainers/cli でインストールしてください"
+    fi
+
+    # jq
+    if command -v jq &> /dev/null; then
+        local jq_version
+        jq_version=$(jq --version 2>/dev/null)
+        log_check "OK" "jq ($jq_version)"
+    else
+        log_check "ERROR" "jqがインストールされていません"
+        echo "   brew install jq または apt-get install jq でインストールしてください"
+    fi
+
+    # tmux (推奨)
+    if command -v tmux &> /dev/null; then
+        local tmux_version
+        tmux_version=$(tmux -V 2>/dev/null)
+        log_check "OK" "tmux ($tmux_version) - セッション管理に使用"
+    else
+        log_check "WARNING" "tmuxがインストールされていません（推奨）"
+        echo "   brew install tmux または apt-get install tmux でインストールすることを推奨"
+    fi
+
+    # cursor (推奨)
+    if command -v cursor &> /dev/null; then
+        log_check "OK" "Cursor - エディタ連携に使用"
+    else
+        log_check "WARNING" "Cursorがインストールされていません（推奨）"
+        echo "   https://cursor.sh からCursorをインストールすることを推奨"
+    fi
+
+    # git設定チェック
+    if command -v git &> /dev/null; then
+        local git_version
+        git_version=$(git --version | cut -d' ' -f3)
+        log_check "OK" "Git ($git_version)"
+
+        # git設定の確認
+        local git_user_name
+        local git_user_email
+        git_user_name=$(git config user.name 2>/dev/null)
+        git_user_email=$(git config user.email 2>/dev/null)
+
+        if [[ -n "$git_user_name" ]]; then
+            log_check "OK" "Git user.name: $git_user_name"
+        else
+            log_check "WARNING" "Git user.name が設定されていません"
+            echo "   git config --global user.name 'Your Name' で設定してください"
+        fi
+
+        if [[ -n "$git_user_email" ]]; then
+            log_check "OK" "Git user.email: $git_user_email"
+        else
+            log_check "WARNING" "Git user.email が設定されていません"
+            echo "   git config --global user.email 'your.email@example.com' で設定してください"
+        fi
+    fi
+
+    echo
+    echo "■ AWS/ECR 設定チェック（push機能用）"
+    echo
+
+    # AWS CLI
+    if command -v aws &> /dev/null; then
+        local aws_version
+        aws_version=$(aws --version 2>&1 | cut -d' ' -f1)
+        log_check "OK" "AWS CLI ($aws_version)"
+
+        # AWS認証情報の確認
+        if aws sts get-caller-identity >/dev/null 2>&1; then
+            local aws_account
+            aws_account=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
+            log_check "OK" "AWS認証情報 (アカウント: $aws_account)"
+        else
+            log_check "WARNING" "AWS認証情報が設定されていません"
+            echo "   aws configure でAWS認証情報を設定してください（ECRプッシュ時に必要）"
+        fi
+
+        # envchain確認
+        if command -v envchain &> /dev/null; then
+            log_check "OK" "envchain - AWS認証情報管理に使用"
+        else
+            log_check "WARNING" "envchainがインストールされていません（推奨）"
+            echo "   brew install envchain でインストールすることを推奨"
+        fi
+    else
+        log_check "WARNING" "AWS CLIがインストールされていません"
+        echo "   ECRプッシュ機能を使用する場合は AWS CLI が必要です"
+        echo "   https://aws.amazon.com/cli/ からインストールしてください"
+    fi
+
+    echo
+    echo "■ 権限・設定チェック"
+    echo
+
+    # 現在のユーザーがdockerグループに属しているか（Linux）
+    if [[ "$(uname)" != "Darwin" ]]; then
+        if groups | grep -q docker; then
+            log_check "OK" "Dockerグループメンバーシップ"
+        else
+            log_check "WARNING" "ユーザーがdockerグループに属していません"
+            echo "   sudo usermod -aG docker \$USER でグループに追加し、再ログインしてください"
+        fi
+    fi
+
+    # HOME/.claude ディレクトリ（devcontainerマウント用）
+    if [[ -d "$HOME/.claude" ]]; then
+        log_check "OK" "Claude設定ディレクトリ: $HOME/.claude"
+    else
+        log_check "WARNING" "Claude設定ディレクトリが見つかりません: $HOME/.claude"
+        echo "   Claude Desktop使用時に設定が引き継がれない可能性があります"
+    fi
+
+    # .env ファイル
+    if [[ -f "$PROJECT_ROOT/.env" ]]; then
+        log_check "OK" ".envファイル"
+    else
+        log_check "WARNING" ".envファイルが見つかりません"
+        echo "   環境変数が必要な場合は .env ファイルを作成してください"
+    fi
+
+    echo
+    echo "■ 既存ワークスペース・コンテナ状況"
+    echo
+
+    # 既存のワークスペース
+    local workspace_dir="$PROJECT_ROOT/.vibebox-workspaces"
+    if [[ -d "$workspace_dir" ]]; then
+        local workspace_count
+        workspace_count=$(find "$workspace_dir" -maxdepth 1 -type d | wc -l)
+        workspace_count=$((workspace_count - 1)) # ディレクトリ自体を除く
+
+        if [[ $workspace_count -gt 0 ]]; then
+            log_check "OK" "既存ワークスペース: $workspace_count 個"
+            echo "   '$0 list' で詳細を確認できます"
+        else
+            log_check "OK" "ワークスペースディレクトリ（空）"
+        fi
+    else
+        log_check "OK" "ワークスペースなし（初回セットアップ）"
+    fi
+
+    # 稼働中のvibeboxコンテナ
+    if command -v docker &> /dev/null && docker info >/dev/null 2>&1; then
+        local git_repo_name
+        git_repo_name=$(basename "$PROJECT_ROOT" 2>/dev/null)
+
+        if [[ -n "$git_repo_name" ]]; then
+            local running_containers
+            running_containers=$(docker ps --filter "name=vibebox.${git_repo_name}" --format "{{.ID}}" 2>/dev/null | wc -l)
+
+            if [[ $running_containers -gt 0 ]]; then
+                log_check "OK" "稼働中のvibeboxコンテナ: $running_containers 個"
+                echo "   '$0 list' で詳細を確認できます"
+            else
+                log_check "OK" "稼働中のvibeboxコンテナなし"
+            fi
+        fi
+    fi
+
+    echo
+    echo "=== 診断結果サマリー ==="
+    echo
+
+    case "$overall_status" in
+        "OK")
+            echo "🎉 すべてのチェックが正常に完了しました。vibeboxを使用する準備ができています。"
+            ;;
+        "WARNING")
+            echo "⚠️  $warning_count 個の警告があります。基本機能は使用できますが、一部機能で制限がある可能性があります。"
+            ;;
+        "ERROR")
+            echo "❌ $error_count 個のエラーがあります。vibeboxを正常に使用するには修正が必要です。"
+            ;;
+    esac
+
+    if [[ $warning_count -gt 0 || $error_count -gt 0 ]]; then
+        echo
+        echo "推奨アクション:"
+        if [[ $error_count -gt 0 ]]; then
+            echo "1. 上記のエラー項目を修正してください"
+            echo "2. 修正後、'$0 doctor' を再実行して確認してください"
+        fi
+        if [[ $warning_count -gt 0 ]]; then
+            echo "1. 警告項目の修正を検討してください（機能向上のため）"
+        fi
+        echo "3. 問題が解決しない場合は、'$0 init' でセットアップを再実行してください"
+    else
+        echo
+        echo "次のステップ:"
+        echo "1. '$0 container build' - Dockerイメージのビルド"
+        echo "2. '$0 up <branch-name>' - 開発セッションの開始"
+    fi
+
+    echo
+}
+
+# メイン処理
+main() {
+    # 引数がない場合はヘルプを表示
+    if [[ $# -eq 0 ]]; then
+        show_usage
+        exit 1
+    fi
+
+    case "$1" in
+        init)
+            shift
+
+            # オプション解析
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            init_vibebox
+            ;;
+        container)
+            if [[ "$2" != "build" && "$2" != "tag" && "$2" != "push" ]]; then
+                echo "エラー: 'container' コマンドには 'build'、'tag'、または 'push' サブコマンドが必要です" >&2
+                show_usage
+                exit 1
+            fi
+            local subcommand="$2"
+            shift 2
+
+            case "$subcommand" in
+                build)
+                    local custom_tag=""
+                    local use_aws_env="false"
+                    local no_cache="false"
+                    local custom_build_args=()
+
+                    # オプション解析
+                    while [[ $# -gt 0 ]]; do
+                        case "$1" in
+                            --tag)
+                                custom_tag="$2"
+                                shift 2
+                                ;;
+                            --build-arg)
+                                custom_build_args+=(--build-arg "$2")
+                                shift 2
+                                ;;
+                            --no-cache)
+                                no_cache="true"
+                                shift
+                                ;;
+                            --help|-h)
+                                show_usage
+                                exit 0
+                                ;;
+                            *)
+                                echo "エラー: 不明なオプション: $1" >&2
+                                show_usage
+                                exit 1
+                                ;;
+                        esac
+                    done
+
+                    # タグを決定
+                    if [[ -n "$custom_tag" ]]; then
+                        TAG="$custom_tag"
+                    fi
+
+                    build_image "$TAG" "$use_aws_env" "$no_cache" "${custom_build_args[@]}"
+                    ;;
+                tag)
+                    container_tag_command "$@"
+                    ;;
+                push)
+                    local custom_tag=""
+
+                    # オプション解析
+                    while [[ $# -gt 0 ]]; do
+                        case "$1" in
+                            --tag)
+                                custom_tag="$2"
+                                shift 2
+                                ;;
+                            --help|-h)
+                                show_usage
+                                exit 0
+                                ;;
+                            *)
+                                echo "エラー: 不明なオプション: $1" >&2
+                                show_usage
+                                exit 1
+                                ;;
+                        esac
+                    done
+
+                    # タグを決定
+                    if [[ -n "$custom_tag" ]]; then
+                        TAG="$custom_tag"
+                    fi
+
+                    push_image "$TAG"
+                    ;;
+            esac
+            ;;
+        up|open)
+            shift
+            local branch_name=""
+            local attach_flag="true"
+
+            # 最初の引数がブランチ名
+            if [[ $# -gt 0 && "$1" != --* ]]; then
+                branch_name="$1"
+                shift
+            fi
+
+            # オプション解析
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --no-attach)
+                        attach_flag="false"
+                        shift
+                        ;;
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            # ブランチ名が指定されているかチェック
+            if [[ -z "$branch_name" ]]; then
+                echo "エラー: ブランチ名は必須です" >&2
+                show_usage
+                exit 1
+            fi
+
+            start_session "$branch_name" "$attach_flag"
+            ;;
+        list|ls)
+            shift
+
+            # オプション解析（将来拡張用）
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            # これまでの list（セッション一覧）は廃止し、
+            # ワークスペース一覧（ws ls）に委譲します。
+            list_workspaces
+            ;;
+        attach)
+            shift
+            local branch_name=""
+
+            # 最初の引数がブランチ名
+            if [[ $# -gt 0 && "$1" != --* ]]; then
+                branch_name="$1"
+                shift
+            fi
+
+            # オプション解析
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            # ブランチ名の有無に関わらずattach_sessionを呼び出す
+            attach_session "$branch_name"
+            ;;
+        down|close)
+            shift
+            local branch_name=""
+            local stop_all="false"
+            local remove_workspace="false"
+
+            # オプション解析
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --all)
+                        stop_all="true"
+                        shift
+                        ;;
+                    --rm)
+                        remove_workspace="true"
+                        shift
+                        ;;
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        # ブランチ名を取得
+                        if [[ -z "$branch_name" ]]; then
+                            branch_name="$1"
+                            shift
+                        else
+                            echo "エラー: 不明なオプション: $1" >&2
+                            show_usage
+                            exit 1
+                        fi
+                        ;;
+                esac
+            done
+
+            # --allオプションが指定された場合
+            if [[ "$stop_all" == "true" ]]; then
+                stop_all_sessions "$remove_workspace"
+            else
+                # ブランチ名が指定されていない場合でも、stop_session内で自動取得を試行
+                stop_session "$branch_name" "$remove_workspace"
+            fi
+            ;;
+        shell)
+            shift
+            local branch_name=""
+
+            # 最初の引数がブランチ名
+            if [[ $# -gt 0 && "$1" != --* ]]; then
+                branch_name="$1"
+                shift
+            fi
+
+            # オプション解析
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            # ブランチ名が指定されていない場合でも、shell_session内で自動取得を試行
+            shell_session "$branch_name"
+            ;;
+        edit)
+            shift
+            local branch_name=""
+
+            # 最初の引数がブランチ名
+            if [[ $# -gt 0 && "$1" != --* ]]; then
+                branch_name="$1"
+                shift
+            fi
+
+            # オプション解析
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            # ブランチ名が指定されていない場合でも、edit_session内で自動取得を試行
+            edit_session "$branch_name"
+            ;;
+        cd)
+            shift
+            local branch_name=""
+
+            if [[ $# -gt 0 && "$1" != --* ]]; then
+                branch_name="$1"
+                shift
+            fi
+
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            cd_local_session "$branch_name"
+            ;;
+        cleanup)
+            shift
+
+            # オプション解析
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            cleanup_worktrees
+            ;;
+        link)
+            shift
+
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            link_vibebox_command
+            ;;
+        doctor)
+            shift
+
+            # オプション解析
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            doctor_check
+            ;;
+        workspace|ws)
+            if [[ "$2" != "list" && "$2" != "ls" ]]; then
+                echo "エラー: 'workspace' コマンドには 'list' または 'ls' サブコマンドが必要です" >&2
+                show_usage
+                exit 1
+            fi
+            local subcommand="$2"
+            shift 2
+
+            case "$subcommand" in
+                list|ls)
+                    # オプション解析
+                    while [[ $# -gt 0 ]]; do
+                        case "$1" in
+                            --help|-h)
+                                show_usage
+                                exit 0
+                                ;;
+                            *)
+                                echo "エラー: 不明なオプション: $1" >&2
+                                show_usage
+                                exit 1
+                                ;;
+                        esac
+                    done
+
+                    list_workspaces
+                    ;;
+            esac
+            ;;
+        secrets)
+            if [[ "$2" != "set" ]]; then
+                echo "エラー: 'secrets' コマンドには 'set' サブコマンドが必要です" >&2
+                show_usage
+                exit 1
+            fi
+            shift 2
+
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            secrets_set
+            ;;
+        rm)
+            shift
+            local branch_name=""
+
+            # 最初の引数がブランチ名
+            if [[ $# -gt 0 && "$1" != --* ]]; then
+                branch_name="$1"
+                shift
+            fi
+
+            # オプション解析
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            remove_workspace "$branch_name"
+            ;;
+        help|--help|-h)
+            show_usage
+            exit 0
+            ;;
+        *)
+            echo "エラー: 不明なコマンド: $1" >&2
+            show_usage
+            exit 1
+            ;;
+    esac
+}
+
+# スクリプトが直接実行された場合のみmain関数を呼び出し
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
