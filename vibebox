@@ -282,7 +282,7 @@ Usage: $0 <command> [options]
     rm [branch-name]           指定ブランチのワークスペースを削除（確認プロンプト有り）
 
 ■ メンテナンス
-    cleanup                    すべてのvibeboxワークスペースを削除
+    clean | cleanup            vibeboxイメージ由来のコンテナとワークスペースを削除
 
 ■ その他
     help                       このヘルプを表示
@@ -1981,7 +1981,7 @@ init_vibebox() {
 
 # cleanupコマンド
 cleanup_worktrees() {
-    echo "=== vibeboxワークスペースを削除 ==="
+    echo "=== vibeboxコンテナとワークスペースを削除 ==="
     echo
 
     # gitリポジトリかどうかチェック
@@ -2002,52 +2002,6 @@ cleanup_worktrees() {
     echo "vibeboxディレクトリ: $vibebox_dir"
     echo
 
-    local vibebox_container_name="vibebox.${git_repo_name}"
-
-    # 稼働中のセッションをチェック
-    local running_sessions
-    running_sessions=$(docker_cmd ps --filter "name=${vibebox_container_name}" --format "{{.ID}}" 2>/dev/null)
-
-    if [[ -n "$running_sessions" ]]; then
-        echo "⚠️  警告: 以下のvibeboxセッションが稼働中です："
-        echo
-
-        # 各コンテナの詳細を表示
-        while IFS= read -r container_id; do
-            if [[ -n "$container_id" ]]; then
-                # マウント情報を取得してブランチ名を抽出
-                local mount_info branch_name
-                local all_mounts
-                all_mounts=$(docker_cmd inspect "$container_id" --format '{{range .Mounts}}{{printf "%s:%s\n" .Source .Destination}}{{end}}' 2>/dev/null)
-                mount_info=$(echo "$all_mounts" | grep -E ":(/workspace|/home/[^/]+/workspace)/" | head -1)
-
-                if [[ -n "$mount_info" ]]; then
-                    local source_path="${mount_info%%:*}"
-                    local dest_path="${mount_info##*:}"
-
-                    if [[ "$dest_path" =~ ^/workspace/(.+)$ ]]; then
-                        branch_name="${BASH_REMATCH[1]}"
-                        echo "  - ブランチ: $branch_name (コンテナID: $container_id)"
-                    elif [[ "$dest_path" =~ ^/home/[^/]+/workspace/(.+)$ ]]; then
-                        branch_name="${BASH_REMATCH[1]}"
-                        echo "  - ブランチ: $branch_name (コンテナID: $container_id)"
-                    fi
-                fi
-            fi
-        done <<< "$running_sessions"
-
-        echo
-        echo "セッションを停止してから再度実行してください："
-        echo "  $0 down --all"
-        echo
-        read -p "稼働中のセッションを無視して続行しますか？ (y/N): " -r
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            echo "クリーンアップを中止しました。"
-            exit 1
-        fi
-        echo
-    fi
-
     # 既存のワークスペースを一覧表示
     echo "削除対象のワークスペース："
     local workspace_count=0
@@ -2062,20 +2016,46 @@ cleanup_worktrees() {
         done
     fi
 
-    if [[ $workspace_count -eq 0 ]]; then
-        echo "  削除対象のワークスペースがありません。"
-        return 0
+    local vibebox_container_ids
+    vibebox_container_ids=$(docker_cmd ps -a --format '{{.ID}} {{.Image}}' 2>/dev/null | awk '$2 ~ /^vibebox/ {print $1}')
+
+    local container_count=0
+    if [[ -n "$vibebox_container_ids" ]]; then
+        container_count=$(printf '%s\n' "$vibebox_container_ids" | awk 'NF {count++} END {print count+0}')
     fi
 
     echo
-    echo "合計 $workspace_count 個のワークスペースが削除されます。"
+    echo "削除対象のコンテナ: $container_count 個"
+    echo "削除対象のワークスペース: $workspace_count 個"
+    if [[ $container_count -eq 0 && $workspace_count -eq 0 ]]; then
+        echo "削除対象はありません。"
+        return 0
+    fi
     echo
 
     # 確認プロンプト
-    read -p "本当にすべてのvibeboxワークスペースを削除しますか？ (y/N): " -r
+    read -p "本当にすべてのvibeboxコンテナとワークスペースを削除しますか？ (y/N): " -r
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         echo "クリーンアップを中止しました。"
         exit 0
+    fi
+
+    echo
+    echo "コンテナを削除中..."
+
+    local removed_container_count=0
+    if [[ -n "$vibebox_container_ids" ]]; then
+        while IFS= read -r container_id; do
+            if [[ -n "$container_id" ]]; then
+                echo "  削除中: $container_id"
+                if docker_cmd rm -f "$container_id" >/dev/null 2>&1; then
+                    echo "    ✓ コンテナを削除しました"
+                    removed_container_count=$((removed_container_count + 1))
+                else
+                    echo "    ✗ コンテナの削除に失敗しました"
+                fi
+            fi
+        done <<< "$vibebox_container_ids"
     fi
 
     echo
@@ -2111,6 +2091,7 @@ cleanup_worktrees() {
 
     echo
     echo "=== クリーンアップ完了 ==="
+    echo "削除されたコンテナ: $removed_container_count 個"
     echo "削除されたワークスペース: $removed_count 個"
     if [[ $error_count -gt 0 ]]; then
         echo "削除に失敗したワークスペース: $error_count 個"
@@ -2988,7 +2969,7 @@ main() {
 
             cd_local_session "$branch_name"
             ;;
-        cleanup)
+        clean|cleanup)
             shift
 
             # オプション解析
