@@ -20,6 +20,16 @@ clone_or_update_repo() {
     gh repo clone "$repo" "$target_dir" || echo "Failed to clone $repo"
 }
 
+echo "Starting SSH server..."
+sudo ssh-keygen -A
+sudo mkdir -p /run/sshd "$USER_HOME/.ssh"
+sudo chmod 700 "$USER_HOME/.ssh"
+sudo chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.ssh"
+sudo chmod 600 "$USER_HOME/.ssh/authorized_keys" 2>/dev/null || true
+if ! pgrep -x sshd >/dev/null 2>&1; then
+    sudo /usr/sbin/sshd
+fi
+
 echo "Fixing GitHub CLI permissions..."
 if [ -d "$USER_HOME/.config/gh" ]; then
     sudo chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.config/gh"

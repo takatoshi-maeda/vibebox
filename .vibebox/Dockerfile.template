@@ -32,6 +32,7 @@ RUN apt update && apt install -y less \
   ripgrep \
   zip \
   curl \
+  openssh-server \
   tree
 
 # 日本語ロケールの設定
@@ -45,6 +46,19 @@ ENV LANG=ja_JP.UTF-8 \
 
 RUN export USERNAME=$USERNAME && \
     echo "$USERNAME ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/$USERNAME
+
+# Configure SSH access for OrbStack container domains.
+RUN mkdir -p /run/sshd /home/$USERNAME/.ssh \
+  && chmod 700 /home/$USERNAME/.ssh \
+  && chown -R $USERNAME:$USERNAME /home/$USERNAME/.ssh \
+  && printf '%s\n' \
+    'PasswordAuthentication no' \
+    'KbdInteractiveAuthentication no' \
+    'ChallengeResponseAuthentication no' \
+    'PubkeyAuthentication yes' \
+    'PermitRootLogin no' \
+    "AllowUsers $USERNAME" \
+    > /etc/ssh/sshd_config.d/vibebox.conf
 
 USER $USERNAME
 
