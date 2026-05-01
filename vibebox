@@ -254,6 +254,7 @@ Usage: $0 <command> [options]
 
 ■ セットアップ
     init                       .vibeboxディレクトリを初期化（テンプレートファイルを配置）
+    update [--dry-run] [--yes] init済みプロジェクトに最新のvibebox設定差分を適用
     container build [--tag TAG] [--build-arg KEY=VALUE] [--no-cache]
                                .vibebox/Dockerfileを使ってvibeboxイメージをビルド（レガシー）
     container tag [--tag TAG]   ローカルのvibeboxイメージにECRタグを付与（レガシー）
@@ -261,7 +262,7 @@ Usage: $0 <command> [options]
     doctor                     vibebox環境の健全性をチェック
 
 ■ セッション制御
-    list | ls                  ワークスペース一覧を表示（`ws ls` のエイリアス）
+    list | ls                  ワークスペース一覧を表示（ws ls のエイリアス）
     up <branch-name> [--no-attach]
                                指定されたブランチでvibeboxコンテナセッションを開始（ワークスペースを自動作成）
                                devcontainer.jsonのrunArgsにブランチ名を追加して起動
@@ -296,6 +297,8 @@ Options:
     --tag TAG                  Dockerイメージのタグを指定 (container build/pushのみ)
     --build-arg KEY=VALUE      Dockerビルド引数を指定 (container buildのみ)
     --no-cache                 Dockerビルド時にキャッシュを使用しない (container buildのみ)
+    --dry-run                  変更内容のみ表示してファイルを書き換えない (updateのみ)
+    --yes                      確認プロンプトを省略する (updateのみ)
 
 Requirements:
     - devcontainer CLI: npm install -g @devcontainers/cli
@@ -1979,6 +1982,307 @@ init_vibebox() {
     echo "3. 'vibebox up <branch-name>' でセッションを開始してください"
 }
 
+clean_jsonc_file() {
+    sed 's://.*$::g; s:/\*.*\*/::g' "$1"
+}
+
+backup_file_for_update() {
+    local file_path="$1"
+    local timestamp="$2"
+
+    cp "$file_path" "${file_path}.bak.${timestamp}"
+    echo "バックアップを作成: ${file_path}.bak.${timestamp}"
+}
+
+write_updated_file() {
+    local source_file="$1"
+    local updated_file="$2"
+    local dry_run="$3"
+    local timestamp="$4"
+    local target_file="${5:-$source_file}"
+
+    if cmp -s "$source_file" "$updated_file"; then
+        echo "変更なし: $target_file"
+        return 1
+    fi
+
+    if [[ "$dry_run" == "true" ]]; then
+        echo "変更予定: $target_file"
+        diff -u "$source_file" "$updated_file" || true
+        return 0
+    fi
+
+    if [[ -f "$target_file" ]]; then
+        backup_file_for_update "$target_file" "$timestamp"
+    else
+        mkdir -p "$(dirname "$target_file")"
+    fi
+    cp "$updated_file" "$target_file"
+    echo "更新しました: $target_file"
+    return 0
+}
+
+generate_updated_dockerfile() {
+    local source_file="$1"
+    local updated_file="$2"
+
+    cp "$source_file" "$updated_file"
+
+    if ! grep -q 'openssh-server' "$updated_file"; then
+        cat >> "$updated_file" <<'EOF'
+
+# vibebox-update: install SSH server for OrbStack container domains.
+USER root
+RUN apt update && apt install -y openssh-server
+EOF
+    fi
+
+    if ! grep -q 'sshd_config.d/vibebox.conf' "$updated_file"; then
+        cat >> "$updated_file" <<'EOF'
+
+# vibebox-update: configure SSH access for OrbStack container domains.
+USER root
+RUN mkdir -p /run/sshd /home/$USERNAME/.ssh \
+  && chmod 700 /home/$USERNAME/.ssh \
+  && chown -R $USERNAME:$USERNAME /home/$USERNAME/.ssh \
+  && printf '%s\n' \
+    'PasswordAuthentication no' \
+    'KbdInteractiveAuthentication no' \
+    'ChallengeResponseAuthentication no' \
+    'PubkeyAuthentication yes' \
+    'PermitRootLogin no' \
+    "AllowUsers $USERNAME" \
+    > /etc/ssh/sshd_config.d/vibebox.conf
+USER $USERNAME
+EOF
+    fi
+}
+
+generate_updated_devcontainer_json() {
+    local source_file="$1"
+    local updated_file="$2"
+    local remote_user="$3"
+    local cleaned_file
+    cleaned_file=$(mktemp)
+
+    clean_jsonc_file "$source_file" > "$cleaned_file"
+
+    local authorized_keys_mount="source=\${localWorkspaceFolder}/.devcontainer/.vibebox-authorized_keys,target=/home/${remote_user}/.ssh/authorized_keys,type=bind,readonly"
+    local ssh_init_command='mkdir -p .devcontainer && if ls "${HOME}/.ssh/"*.pub >/dev/null 2>&1; then cat "${HOME}/.ssh/"*.pub > .devcontainer/.vibebox-authorized_keys && chmod 600 .devcontainer/.vibebox-authorized_keys; else : > .devcontainer/.vibebox-authorized_keys && chmod 600 .devcontainer/.vibebox-authorized_keys && echo '\''Warning: no SSH public keys found in ~/.ssh/*.pub; SSH login to the vibebox container will fail until a public key is added.'\'' >&2; fi'
+
+    jq --arg mount "$authorized_keys_mount" --arg ssh_init "$ssh_init_command" '
+        .mounts = ((.mounts // []) as $mounts |
+            if ($mounts | map(tostring | contains(".vibebox-authorized_keys")) | any) then
+                $mounts
+            else
+                $mounts + [$mount]
+            end
+        )
+        |
+        if ((.initializeCommand // "" | tostring) | contains(".vibebox-authorized_keys")) then
+            .
+        elif ((.initializeCommand // null) | type) == "array"
+             and (.initializeCommand | length) >= 3
+             and .initializeCommand[0] == "bash"
+             and .initializeCommand[1] == "-c" then
+            .initializeCommand[2] = ($ssh_init + " && " + .initializeCommand[2])
+        elif ((.initializeCommand // null) | type) == "string" then
+            .initializeCommand = ($ssh_init + " && " + .initializeCommand)
+        elif .initializeCommand == null then
+            .initializeCommand = ["bash", "-c", $ssh_init]
+        elif ((.initializeCommand // null) | type) == "array" then
+            .initializeCommand = ["bash", "-c", $ssh_init + " && " + (.initializeCommand | join(" "))]
+        else
+            .initializeCommand = ["bash", "-c", $ssh_init + " && " + (.initializeCommand | tostring)]
+        end
+    ' "$cleaned_file" > "$updated_file"
+
+    rm -f "$cleaned_file"
+}
+
+generate_updated_hooks_post_start() {
+    local source_file="$1"
+    local updated_file="$2"
+
+    if grep -q 'vibebox-update: start SSH server' "$source_file" || grep -q 'sudo /usr/sbin/sshd' "$source_file"; then
+        cp "$source_file" "$updated_file"
+        return 0
+    fi
+
+    awk '
+        BEGIN {
+            in_clone_func = 0
+            inserted = 0
+        }
+        /^clone_or_update_repo\(\)/ {
+            in_clone_func = 1
+        }
+        {
+            print
+        }
+        in_clone_func && !inserted && /^}$/ {
+            print ""
+            print "# vibebox-update: start SSH server for OrbStack container domains."
+            print "echo \"Starting SSH server...\""
+            print "sudo ssh-keygen -A"
+            print "sudo mkdir -p /run/sshd \"$USER_HOME/.ssh\""
+            print "sudo chmod 700 \"$USER_HOME/.ssh\""
+            print "sudo chown \"$CURRENT_USER:$CURRENT_USER\" \"$USER_HOME/.ssh\""
+            print "sudo chmod 600 \"$USER_HOME/.ssh/authorized_keys\" 2>/dev/null || true"
+            print "if ! pgrep -x sshd >/dev/null 2>&1; then"
+            print "    sudo /usr/sbin/sshd"
+            print "fi"
+            inserted = 1
+            in_clone_func = 0
+        }
+        END {
+            if (!inserted) {
+                print ""
+                print "# vibebox-update: start SSH server for OrbStack container domains."
+                print "echo \"Starting SSH server...\""
+                print "sudo ssh-keygen -A"
+                print "sudo mkdir -p /run/sshd \"$USER_HOME/.ssh\""
+                print "sudo chmod 700 \"$USER_HOME/.ssh\""
+                print "sudo chown \"$CURRENT_USER:$CURRENT_USER\" \"$USER_HOME/.ssh\""
+                print "sudo chmod 600 \"$USER_HOME/.ssh/authorized_keys\" 2>/dev/null || true"
+                print "if ! pgrep -x sshd >/dev/null 2>&1; then"
+                print "    sudo /usr/sbin/sshd"
+                print "fi"
+            }
+        }
+    ' "$source_file" > "$updated_file"
+}
+
+generate_updated_gitignore() {
+    local source_file="$1"
+    local updated_file="$2"
+
+    cp "$source_file" "$updated_file"
+    if ! grep -Fxq '.devcontainer/.vibebox-authorized_keys' "$updated_file"; then
+        printf '\n.devcontainer/.vibebox-authorized_keys\n' >> "$updated_file"
+    fi
+}
+
+update_vibebox() {
+    local dry_run="$1"
+    local assume_yes="$2"
+
+    echo "=== vibebox 設定を更新 ==="
+    echo
+
+    local target_dir
+    target_dir="$(pwd)"
+    local dockerfile_path="$target_dir/.vibebox/Dockerfile"
+    local devcontainer_json="$target_dir/.devcontainer/devcontainer.json"
+    local hooks_post_start="$target_dir/.devcontainer/hooks-post-start.sh"
+    local gitignore_path="$target_dir/.gitignore"
+
+    if [[ ! -f "$dockerfile_path" || ! -f "$devcontainer_json" ]]; then
+        echo "エラー: init済みのvibeboxプロジェクトではありません。" >&2
+        echo "必要なファイル: .vibebox/Dockerfile, .devcontainer/devcontainer.json" >&2
+        echo "'vibebox init' を先に実行してください。" >&2
+        exit 1
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        echo "エラー: jqがインストールされていません。jqをインストールしてください。" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$hooks_post_start" ]]; then
+        echo "エラー: hooks-post-start.shが見つかりません: $hooks_post_start" >&2
+        echo "'vibebox init' で生成された .devcontainer/hooks-post-start.sh が必要です。" >&2
+        exit 1
+    fi
+
+    local cleaned_json
+    cleaned_json=$(clean_jsonc_file "$devcontainer_json")
+    if ! printf '%s\n' "$cleaned_json" | jq . >/dev/null 2>&1; then
+        echo "エラー: devcontainer.json の構文チェックに失敗しました。" >&2
+        exit 1
+    fi
+
+    local remote_user
+    remote_user=$(printf '%s\n' "$cleaned_json" | jq -r '.remoteUser // empty' 2>/dev/null)
+    if [[ -z "$remote_user" || "$remote_user" == "null" ]]; then
+        remote_user="${VIBEBOX_CONTAINER_USERNAME:-vibebox}"
+    fi
+
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    trap 'rm -rf "$temp_dir"' RETURN
+
+    local updated_dockerfile="$temp_dir/Dockerfile"
+    local updated_devcontainer="$temp_dir/devcontainer.json"
+    local updated_hooks="$temp_dir/hooks-post-start.sh"
+    local updated_gitignore="$temp_dir/gitignore"
+    local gitignore_source="$gitignore_path"
+    if [[ ! -f "$gitignore_source" ]]; then
+        gitignore_source="$temp_dir/gitignore.original"
+        : > "$gitignore_source"
+    fi
+
+    generate_updated_dockerfile "$dockerfile_path" "$updated_dockerfile"
+    generate_updated_devcontainer_json "$devcontainer_json" "$updated_devcontainer" "$remote_user"
+    generate_updated_hooks_post_start "$hooks_post_start" "$updated_hooks"
+    generate_updated_gitignore "$gitignore_source" "$updated_gitignore"
+
+    local changes=0
+    cmp -s "$dockerfile_path" "$updated_dockerfile" || changes=$((changes + 1))
+    cmp -s "$devcontainer_json" "$updated_devcontainer" || changes=$((changes + 1))
+    cmp -s "$hooks_post_start" "$updated_hooks" || changes=$((changes + 1))
+    cmp -s "$gitignore_source" "$updated_gitignore" || changes=$((changes + 1))
+
+    echo "更新対象:"
+    echo "  - .vibebox/Dockerfile"
+    echo "  - .devcontainer/devcontainer.json"
+    echo "  - .devcontainer/hooks-post-start.sh"
+    echo "  - .gitignore"
+    echo
+    echo "SSHユーザー: $remote_user"
+    echo "変更が必要なファイル数: $changes"
+    echo
+
+    if [[ "$changes" -eq 0 ]]; then
+        echo "更新は不要です。"
+        return 0
+    fi
+
+    if [[ "$dry_run" == "true" ]]; then
+        echo "=== dry-run: 変更内容 ==="
+    elif [[ "$assume_yes" != "true" ]]; then
+        read -p "上記の設定を更新しますか？ (y/N): " -r
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "更新を中止しました。"
+            return 0
+        fi
+    fi
+
+    local timestamp
+    timestamp=$(date +%Y%m%d%H%M%S)
+
+    write_updated_file "$dockerfile_path" "$updated_dockerfile" "$dry_run" "$timestamp" || true
+    write_updated_file "$devcontainer_json" "$updated_devcontainer" "$dry_run" "$timestamp" || true
+    write_updated_file "$hooks_post_start" "$updated_hooks" "$dry_run" "$timestamp" || true
+    write_updated_file "$gitignore_source" "$updated_gitignore" "$dry_run" "$timestamp" "$gitignore_path" || true
+
+    if [[ "$dry_run" == "true" ]]; then
+        echo
+        echo "dry-runのためファイルは変更していません。"
+        return 0
+    fi
+
+    chmod +x "$hooks_post_start"
+
+    echo
+    echo "=== 更新完了 ==="
+    echo "次のステップ:"
+    echo "1. 'vibebox container build' でDockerイメージを再ビルドしてください"
+    echo "2. 既存の稼働中コンテナは停止・再作成してください"
+    echo "3. 起動後、以下の形式でSSH接続できます:"
+    echo "   ssh ${remote_user}@vibebox.<repo>.<branch>.orb.local"
+}
+
 # cleanupコマンド
 cleanup_worktrees() {
     echo "=== vibeboxコンテナとワークスペースを削除 ==="
@@ -2671,6 +2975,36 @@ main() {
             done
 
             init_vibebox
+            ;;
+        update)
+            shift
+            local dry_run="false"
+            local assume_yes="false"
+
+            # オプション解析
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --dry-run)
+                        dry_run="true"
+                        shift
+                        ;;
+                    --yes|-y)
+                        assume_yes="true"
+                        shift
+                        ;;
+                    --help|-h)
+                        show_usage
+                        exit 0
+                        ;;
+                    *)
+                        echo "エラー: 不明なオプション: $1" >&2
+                        show_usage
+                        exit 1
+                        ;;
+                esac
+            done
+
+            update_vibebox "$dry_run" "$assume_yes"
             ;;
         container)
             if [[ "$2" != "build" && "$2" != "tag" && "$2" != "push" ]]; then
