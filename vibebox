@@ -271,7 +271,7 @@ Usage: $0 <command> [options]
 
 ■ セッション制御
     list | ls                  ワークスペース一覧を表示（ws ls のエイリアス）
-    up [branch-name] [--no-attach]
+    up [branch-name] [--attach|-a]
                                指定されたブランチでvibeboxコンテナセッションを開始（省略時: default、ワークスペースを自動作成）
                                devcontainer.jsonのrunArgsにブランチ名を追加して起動
     down [branch-name] [--rm]
@@ -299,7 +299,7 @@ Usage: $0 <command> [options]
     secrets set               envchainを使ってAWSシークレットを設定
 
 Options:
-    --attach                   セッション開始後にtmuxセッションに自動アタッチ (upのみ)
+    --attach, -a               セッション開始後にtmuxセッションに自動アタッチ (upのみ)
     --all                      すべてのセッションを対象にする (downのみ)
     --rm                       セッション停止後にワークスペースを削除する (downのみ)
     --tag TAG                  Dockerイメージのタグを指定 (container build/pushのみ)
@@ -1570,12 +1570,6 @@ start_session() {
         echo "終了するには 'exit' を実行してください。"
         echo
 
-        # Cursorでワークスペースを開く
-        if command -v cursor &> /dev/null; then
-            echo "Cursorでワークスペースを開いています..."
-            cursor "$workspace_path" &
-        fi
-
         # devcontainerでシェルを起動
         docker_cmd exec -it "$existing_container_id" sh -c "cd $container_workspace_folder && exec \$SHELL"
         return
@@ -1638,12 +1632,6 @@ start_session() {
 
     # tmuxウィンドウでDockerコマンドを実行
     tmux send-keys -t "$tmux_session:$tmux_window" "$docker_exec_cmd" Enter
-
-    # Cursorでワークスペースを開く
-    if command -v cursor &> /dev/null; then
-        echo "Cursorでワークスペースを開いています..."
-        cursor "$workspace_path" &
-    fi
 
     # --attachフラグが設定されている場合のみtmuxセッションにアタッチ
     if [[ "$attach_flag" == "true" ]]; then
@@ -3264,7 +3252,7 @@ main() {
         up|open)
             shift
             local branch_name=""
-            local attach_flag="true"
+            local attach_flag="false"
 
             # 最初の引数がブランチ名
             if [[ $# -gt 0 && "$1" != --* ]]; then
@@ -3275,8 +3263,8 @@ main() {
             # オプション解析
             while [[ $# -gt 0 ]]; do
                 case "$1" in
-                    --no-attach)
-                        attach_flag="false"
+                    --attach|-a)
+                        attach_flag="true"
                         shift
                         ;;
                     --help|-h)
