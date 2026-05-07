@@ -60,7 +60,7 @@
   "initializeCommand": [
     "bash",
     "-c",
-    "mkdir -p .devcontainer && if ls \"${HOME}/.ssh/\"*.pub >/dev/null 2>&1; then cat \"${HOME}/.ssh/\"*.pub > .devcontainer/.vibebox-authorized_keys && chmod 600 .devcontainer/.vibebox-authorized_keys; else : > .devcontainer/.vibebox-authorized_keys && chmod 600 .devcontainer/.vibebox-authorized_keys && echo 'Warning: no SSH public keys found in ~/.ssh/*.pub; SSH login to the vibebox container will fail until a public key is added.' >&2; fi && if [ \"${VIBEBOX_ENABLE_ECR_LOGIN:-false}\" = \"true\" ] && command -v envchain >/dev/null 2>&1; then envchain \"${VIBEBOX_ENVCHAIN_SERVICE:-{ENVCHAIN_SERVICE}}\" .devcontainer/ecr-login.sh; else echo 'Skipping ECR login'; fi && if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then gh api user -q .login > .devcontainer/.github-user 2>/dev/null; else echo 'GitHub CLI not available or not authenticated, skipping user setup'; fi && touch .devcontainer/.zsh_history"
+    "bash .devcontainer/hooks-initialize.sh {USERNAME} vibebox.{REPO_NAME} && if [ \"${VIBEBOX_ENABLE_ECR_LOGIN:-false}\" = \"true\" ] && command -v envchain >/dev/null 2>&1; then envchain \"${VIBEBOX_ENVCHAIN_SERVICE:-{ENVCHAIN_SERVICE}}\" .devcontainer/ecr-login.sh; else echo 'Skipping ECR login'; fi && if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then gh api user -q .login > .devcontainer/.github-user 2>/dev/null; else echo 'GitHub CLI not available or not authenticated, skipping user setup'; fi && touch .devcontainer/.zsh_history"
   ],
   "postStartCommand": "cp .devcontainer/hooks-post-start.sh /home/{USERNAME}/hooks-post-start.sh && chmod +x /home/{USERNAME}/hooks-post-start.sh && /home/{USERNAME}/hooks-post-start.sh",
   "vibebox": {

@@ -1348,6 +1348,34 @@ start_session() {
     # runArgsを更新（--name=vibebox.{repo_name}.{branch_name}の形式で設定）
     # 互換性のため --env-file 指定は自動で除去する
     echo "$cleaned_json" | jq --arg repo_name "$git_repo_name" --arg branch "$sanitized_branch" '
+        def replace_initialize_hook($container_name):
+            . as $root
+            | ($root.remoteUser // "vibebox") as $remote_user
+            | ("bash .devcontainer/hooks-initialize.sh " + $remote_user + " " + $container_name) as $hook
+            |
+            if ((.initializeCommand // null) | type) == "array"
+               and (.initializeCommand | length) >= 3
+               and .initializeCommand[0] == "bash"
+               and .initializeCommand[1] == "-c" then
+                if (.initializeCommand[2] | contains("hooks-initialize.sh")) then
+                    .initializeCommand[2] = (.initializeCommand[2] | sub("bash \\.devcontainer/hooks-initialize\\.sh [^&]+ && "; $hook + " && "))
+                else
+                    .initializeCommand[2] = ($hook + " && " + .initializeCommand[2])
+                end
+            elif ((.initializeCommand // null) | type) == "string" then
+                if (.initializeCommand | contains("hooks-initialize.sh")) then
+                    .initializeCommand = (.initializeCommand | sub("bash \\.devcontainer/hooks-initialize\\.sh [^&]+ && "; $hook + " && "))
+                else
+                    .initializeCommand = ($hook + " && " + .initializeCommand)
+                end
+            elif .initializeCommand == null then
+                .initializeCommand = ["bash", "-c", $hook]
+            elif ((.initializeCommand // null) | type) == "array" then
+                .initializeCommand = ["bash", "-c", $hook + " && " + (.initializeCommand | join(" "))]
+            else
+                .initializeCommand = ["bash", "-c", $hook + " && " + (.initializeCommand | tostring)]
+            end;
+
         def strip_env_file_args:
             reduce .[] as $arg (
                 {skip_next: false, out: []};
@@ -1379,6 +1407,8 @@ start_session() {
                 # --name=が存在しない場合は追加
                 .runArgs = .runArgs + ["--name=vibebox." + $repo_name + "." + $branch]
         end
+        |
+        replace_initialize_hook("vibebox." + $repo_name + "." + $branch)
     ' > "$devcontainer_local_json"
 
     echo "devcontainer.local.jsonを作成しました"
@@ -1869,6 +1899,11 @@ init_vibebox() {
         exit 1
     fi
 
+    if [[ ! -f "$template_dir/.devcontainer/hooks-initialize.sh" ]]; then
+        echo "エラー: hooks-initialize.shテンプレートが見つかりません: $template_dir/.devcontainer/hooks-initialize.sh" >&2
+        exit 1
+    fi
+
     # .vibeboxディレクトリが既に存在するかチェック
     if [[ -d "$target_vibebox_dir" ]]; then
         echo "警告: .vibeboxディレクトリが既に存在します: $target_vibebox_dir"
@@ -1966,6 +2001,12 @@ init_vibebox() {
         chmod +x "$target_dir/.devcontainer/hooks-post-start.sh"
     fi
 
+    if [[ -f "$template_dir/.devcontainer/hooks-initialize.sh" ]]; then
+        echo "ファイルをコピー: .devcontainer/hooks-initialize.sh"
+        cp "$template_dir/.devcontainer/hooks-initialize.sh" "$target_dir/.devcontainer/hooks-initialize.sh"
+        chmod +x "$target_dir/.devcontainer/hooks-initialize.sh"
+    fi
+
     if [[ -f "$template_dir/.devcontainer/ecr-login.sh" ]]; then
         echo "ファイルをコピー: .devcontainer/ecr-login.sh"
         cp "$template_dir/.devcontainer/ecr-login.sh" "$target_dir/.devcontainer/ecr-login.sh"
@@ -1986,12 +2027,82 @@ clean_jsonc_file() {
     sed 's://.*$::g; s:/\*.*\*/::g' "$1"
 }
 
+supports_color_output() {
+    [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]
+}
+
+colorize_unified_diff() {
+    awk '
+        BEGIN {
+            red = sprintf("%c[31m", 27)
+            green = sprintf("%c[32m", 27)
+            cyan = sprintf("%c[36m", 27)
+            bold = sprintf("%c[1m", 27)
+            reset = sprintf("%c[0m", 27)
+        }
+        /^--- / {
+            print bold red $0 reset
+            next
+        }
+        /^\+\+\+ / {
+            print bold green $0 reset
+            next
+        }
+        /^@@ / {
+            print cyan $0 reset
+            next
+        }
+        /^\+/ {
+            print green $0 reset
+            next
+        }
+        /^-/ {
+            print red $0 reset
+            next
+        }
+        {
+            print
+        }
+    '
+}
+
+show_unified_diff() {
+    local source_file="$1"
+    local updated_file="$2"
+
+    if supports_color_output; then
+        diff -u "$source_file" "$updated_file" | colorize_unified_diff
+    else
+        diff -u "$source_file" "$updated_file"
+    fi
+}
+
 backup_file_for_update() {
     local file_path="$1"
     local timestamp="$2"
 
     cp "$file_path" "${file_path}.bak.${timestamp}"
     echo "バックアップを作成: ${file_path}.bak.${timestamp}"
+}
+
+is_git_tracked_file() {
+    local file_path="$1"
+    local file_dir
+    file_dir="$(dirname "$file_path")"
+
+    if ! git -C "$file_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return 1
+    fi
+
+    local git_root
+    git_root="$(git -C "$file_dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
+
+    local relative_path="${file_path#$git_root/}"
+    if [[ "$relative_path" == "$file_path" ]]; then
+        return 1
+    fi
+
+    git -C "$git_root" ls-files --error-unmatch -- "$relative_path" >/dev/null 2>&1
 }
 
 write_updated_file() {
@@ -2008,12 +2119,16 @@ write_updated_file() {
 
     if [[ "$dry_run" == "true" ]]; then
         echo "変更予定: $target_file"
-        diff -u "$source_file" "$updated_file" || true
+        show_unified_diff "$source_file" "$updated_file" || true
         return 0
     fi
 
     if [[ -f "$target_file" ]]; then
-        backup_file_for_update "$target_file" "$timestamp"
+        if is_git_tracked_file "$target_file"; then
+            echo "Git管理下のためバックアップを省略: $target_file"
+        else
+            backup_file_for_update "$target_file" "$timestamp"
+        fi
     else
         mkdir -p "$(dirname "$target_file")"
     fi
@@ -2062,15 +2177,23 @@ generate_updated_devcontainer_json() {
     local source_file="$1"
     local updated_file="$2"
     local remote_user="$3"
+    local repo_name="$4"
     local cleaned_file
     cleaned_file=$(mktemp)
 
     clean_jsonc_file "$source_file" > "$cleaned_file"
 
     local authorized_keys_mount="source=\${localWorkspaceFolder}/.devcontainer/.vibebox-authorized_keys,target=/home/${remote_user}/.ssh/authorized_keys,type=bind,readonly"
-    local ssh_init_command='mkdir -p .devcontainer && if ls "${HOME}/.ssh/"*.pub >/dev/null 2>&1; then cat "${HOME}/.ssh/"*.pub > .devcontainer/.vibebox-authorized_keys && chmod 600 .devcontainer/.vibebox-authorized_keys; else : > .devcontainer/.vibebox-authorized_keys && chmod 600 .devcontainer/.vibebox-authorized_keys && echo '\''Warning: no SSH public keys found in ~/.ssh/*.pub; SSH login to the vibebox container will fail until a public key is added.'\'' >&2; fi'
+    local ssh_init_command="bash .devcontainer/hooks-initialize.sh ${remote_user} vibebox.${repo_name}"
 
     jq --arg mount "$authorized_keys_mount" --arg ssh_init "$ssh_init_command" '
+        def strip_legacy_authorized_keys_command:
+            if contains(".vibebox-authorized_keys") and (contains("hooks-initialize.sh") | not) then
+                sub("^mkdir -p \\.devcontainer && if ls .*?; fi && "; "")
+            else
+                .
+            end;
+
         .mounts = ((.mounts // []) as $mounts |
             if ($mounts | map(tostring | contains(".vibebox-authorized_keys")) | any) then
                 $mounts
@@ -2079,15 +2202,15 @@ generate_updated_devcontainer_json() {
             end
         )
         |
-        if ((.initializeCommand // "" | tostring) | contains(".vibebox-authorized_keys")) then
+        if ((.initializeCommand // "" | tostring) | contains("hooks-initialize.sh")) then
             .
         elif ((.initializeCommand // null) | type) == "array"
              and (.initializeCommand | length) >= 3
              and .initializeCommand[0] == "bash"
              and .initializeCommand[1] == "-c" then
-            .initializeCommand[2] = ($ssh_init + " && " + .initializeCommand[2])
+            .initializeCommand[2] = ($ssh_init + " && " + (.initializeCommand[2] | strip_legacy_authorized_keys_command))
         elif ((.initializeCommand // null) | type) == "string" then
-            .initializeCommand = ($ssh_init + " && " + .initializeCommand)
+            .initializeCommand = ($ssh_init + " && " + (.initializeCommand | strip_legacy_authorized_keys_command))
         elif .initializeCommand == null then
             .initializeCommand = ["bash", "-c", $ssh_init]
         elif ((.initializeCommand // null) | type) == "array" then
@@ -2098,6 +2221,22 @@ generate_updated_devcontainer_json() {
     ' "$cleaned_file" > "$updated_file"
 
     rm -f "$cleaned_file"
+}
+
+generate_updated_hooks_initialize() {
+    local updated_file="$1"
+    local script_path
+    script_path="$(resolve_absolute_path "${BASH_SOURCE[0]}")"
+    local script_dir
+    script_dir="$(dirname "$script_path")"
+    local template_file="$script_dir/.vibebox/.devcontainer/hooks-initialize.sh"
+
+    if [[ ! -f "$template_file" ]]; then
+        echo "エラー: hooks-initialize.shテンプレートが見つかりません: $template_file" >&2
+        exit 1
+    fi
+
+    cp "$template_file" "$updated_file"
 }
 
 generate_updated_hooks_post_start() {
@@ -2174,6 +2313,7 @@ update_vibebox() {
     target_dir="$(pwd)"
     local dockerfile_path="$target_dir/.vibebox/Dockerfile"
     local devcontainer_json="$target_dir/.devcontainer/devcontainer.json"
+    local hooks_initialize="$target_dir/.devcontainer/hooks-initialize.sh"
     local hooks_post_start="$target_dir/.devcontainer/hooks-post-start.sh"
     local gitignore_path="$target_dir/.gitignore"
 
@@ -2208,14 +2348,23 @@ update_vibebox() {
         remote_user="${VIBEBOX_CONTAINER_USERNAME:-vibebox}"
     fi
 
+    local repo_name
+    repo_name="$(basename "$target_dir")"
+
     local temp_dir
     temp_dir=$(mktemp -d)
     trap 'rm -rf "$temp_dir"' RETURN
 
     local updated_dockerfile="$temp_dir/Dockerfile"
     local updated_devcontainer="$temp_dir/devcontainer.json"
+    local updated_hooks_initialize="$temp_dir/hooks-initialize.sh"
     local updated_hooks="$temp_dir/hooks-post-start.sh"
     local updated_gitignore="$temp_dir/gitignore"
+    local hooks_initialize_source="$hooks_initialize"
+    if [[ ! -f "$hooks_initialize_source" ]]; then
+        hooks_initialize_source="$temp_dir/hooks-initialize.original"
+        : > "$hooks_initialize_source"
+    fi
     local gitignore_source="$gitignore_path"
     if [[ ! -f "$gitignore_source" ]]; then
         gitignore_source="$temp_dir/gitignore.original"
@@ -2223,19 +2372,22 @@ update_vibebox() {
     fi
 
     generate_updated_dockerfile "$dockerfile_path" "$updated_dockerfile"
-    generate_updated_devcontainer_json "$devcontainer_json" "$updated_devcontainer" "$remote_user"
+    generate_updated_devcontainer_json "$devcontainer_json" "$updated_devcontainer" "$remote_user" "$repo_name"
+    generate_updated_hooks_initialize "$updated_hooks_initialize"
     generate_updated_hooks_post_start "$hooks_post_start" "$updated_hooks"
     generate_updated_gitignore "$gitignore_source" "$updated_gitignore"
 
     local changes=0
     cmp -s "$dockerfile_path" "$updated_dockerfile" || changes=$((changes + 1))
     cmp -s "$devcontainer_json" "$updated_devcontainer" || changes=$((changes + 1))
+    cmp -s "$hooks_initialize_source" "$updated_hooks_initialize" || changes=$((changes + 1))
     cmp -s "$hooks_post_start" "$updated_hooks" || changes=$((changes + 1))
     cmp -s "$gitignore_source" "$updated_gitignore" || changes=$((changes + 1))
 
     echo "更新対象:"
     echo "  - .vibebox/Dockerfile"
     echo "  - .devcontainer/devcontainer.json"
+    echo "  - .devcontainer/hooks-initialize.sh"
     echo "  - .devcontainer/hooks-post-start.sh"
     echo "  - .gitignore"
     echo
@@ -2263,6 +2415,7 @@ update_vibebox() {
 
     write_updated_file "$dockerfile_path" "$updated_dockerfile" "$dry_run" "$timestamp" || true
     write_updated_file "$devcontainer_json" "$updated_devcontainer" "$dry_run" "$timestamp" || true
+    write_updated_file "$hooks_initialize_source" "$updated_hooks_initialize" "$dry_run" "$timestamp" "$hooks_initialize" || true
     write_updated_file "$hooks_post_start" "$updated_hooks" "$dry_run" "$timestamp" || true
     write_updated_file "$gitignore_source" "$updated_gitignore" "$dry_run" "$timestamp" "$gitignore_path" || true
 
@@ -2272,6 +2425,7 @@ update_vibebox() {
         return 0
     fi
 
+    chmod +x "$hooks_initialize"
     chmod +x "$hooks_post_start"
 
     echo
