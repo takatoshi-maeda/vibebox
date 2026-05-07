@@ -3369,7 +3369,9 @@ main() {
             if [[ "$stop_all" == "true" ]]; then
                 stop_all_sessions "$remove_workspace"
             else
-                # ブランチ名が指定されていない場合でも、stop_session内で自動取得を試行
+                if [[ -z "$branch_name" ]]; then
+                    branch_name="default"
+                fi
                 stop_session "$branch_name" "$remove_workspace"
             fi
             ;;
@@ -3591,6 +3593,10 @@ main() {
                         ;;
                 esac
             done
+
+            if [[ -z "$branch_name" ]]; then
+                branch_name="default"
+            fi
 
             remove_workspace "$branch_name"
             ;;
