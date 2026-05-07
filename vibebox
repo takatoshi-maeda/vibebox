@@ -263,8 +263,8 @@ Usage: $0 <command> [options]
 
 ■ セッション制御
     list | ls                  ワークスペース一覧を表示（ws ls のエイリアス）
-    up <branch-name> [--no-attach]
-                               指定されたブランチでvibeboxコンテナセッションを開始（ワークスペースを自動作成）
+    up [branch-name] [--no-attach]
+                               指定されたブランチでvibeboxコンテナセッションを開始（省略時: default、ワークスペースを自動作成）
                                devcontainer.jsonのrunArgsにブランチ名を追加して起動
     down [branch-name] [--rm]
                                指定されたブランチのvibeboxコンテナセッションを停止（ワークスペースディレクトリ内では省略可）
@@ -946,7 +946,7 @@ list_workspaces() {
         echo "ワークスペースディレクトリが存在しません: $vibebox_dir"
         echo
         echo "ワークスペースを作成するには:"
-        echo "  $0 up <branch-name>"
+        echo "  $0 up [branch-name]"
         return 0
     fi
 
@@ -970,7 +970,7 @@ list_workspaces() {
         echo "ワークスペースが見つかりませんでした。"
         echo
         echo "ワークスペースを作成するには:"
-        echo "  $0 up <branch-name>"
+        echo "  $0 up [branch-name]"
         return 0
     fi
 
@@ -1039,7 +1039,7 @@ list_workspaces() {
     echo "════════════════════════════════════════════════════════════"
     echo
     echo "コマンド:"
-    echo "  セッション開始: $0 up <branch-name>"
+    echo "  セッション開始: $0 up [branch-name]"
     echo "  エディタで開く: $0 edit <branch-name>"
     echo "  シェル起動: $0 shell <branch-name>"
     echo "  セッション停止: $0 down <branch-name>"
@@ -1063,7 +1063,7 @@ list_sessions() {
         echo "現在稼働中のvibeboxセッションはありません。"
         echo
         echo "新しいセッションを開始するには:"
-        echo "  $0 up <branch-name>"
+        echo "  $0 up [branch-name]"
         return 0
     fi
 
@@ -2020,7 +2020,7 @@ init_vibebox() {
     echo "次のステップ:"
     echo "1. 必要に応じて $target_vibebox_dir/Dockerfile を編集してください"
     echo "2. 'vibebox container build' でDockerイメージをビルドしてください"
-    echo "3. 'vibebox up <branch-name>' でセッションを開始してください"
+    echo "3. 'vibebox up [branch-name]' でセッションを開始してください"
 }
 
 clean_jsonc_file() {
@@ -3095,7 +3095,7 @@ doctor_check() {
         echo
         echo "次のステップ:"
         echo "1. '$0 container build' - Dockerイメージのビルド"
-        echo "2. '$0 up <branch-name>' - 開発セッションの開始"
+        echo "2. '$0 up [branch-name]' - 開発セッションの開始"
     fi
 
     echo
@@ -3274,11 +3274,8 @@ main() {
                 esac
             done
 
-            # ブランチ名が指定されているかチェック
             if [[ -z "$branch_name" ]]; then
-                echo "エラー: ブランチ名は必須です" >&2
-                show_usage
-                exit 1
+                branch_name="default"
             fi
 
             start_session "$branch_name" "$attach_flag"
