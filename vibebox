@@ -194,6 +194,12 @@ get_vibebox_container_workspace_folder() {
     echo "/workspace/${repo_name}.${sanitized_branch}"
 }
 
+get_main_container_workspace_folder() {
+    local repo_name="$1"
+
+    echo "/workspace/${repo_name}"
+}
+
 # 与えられたパス（シンボリックリンクを含む）を絶対パスに解決する
 resolve_absolute_path() {
     local path="$1"
@@ -272,17 +278,19 @@ Usage: $0 <command> [options]
 ■ セッション制御
     list | ls                  ワークスペース一覧を表示（ws ls のエイリアス）
     up [branch-name] [--attach|-a]
-                               指定されたブランチでvibeboxコンテナセッションを開始（省略時: default、ワークスペースを自動作成）
-                               devcontainer.jsonのrunArgsにブランチ名を追加して起動
+                               vibeboxコンテナセッションを開始
+                               省略時: メインワークスペースを /workspace/{repo} で起動（ワークスペース作成なし）
+                               branch-name指定時: .vibebox-workspaces配下を /workspace/{repo}.{branch-name} で起動
     down [branch-name] [--rm]
-                               指定されたブランチのvibeboxコンテナセッションを停止（ワークスペースディレクトリ内では省略可）
-                               --rm を指定すると停止後にワークスペースを削除
+                               vibeboxコンテナセッションを停止
+                               省略時: メインワークスペースを停止（--rm は無視）
+                               branch-name指定時: 指定ブランチを停止し、--rm でワークスペースを削除
     down --all [--rm]          すべてのvibeboxコンテナセッションを停止（--rm指定時はワークスペースも削除）
 
 ■ ワークスペースアクセス
     shell [branch-name]        指定されたブランチのvibeboxコンテナでシェルを起動（ワークスペースディレクトリ内では省略可）
     edit [branch-name]         指定されたブランチのワークスペースディレクトリをCursorで開く（ワークスペースディレクトリ内では省略可）
-    attach [branch-name]       tmuxセッションにアタッチ（省略時はデフォルトdevcontainerへ直接アタッチ）
+    attach [branch-name]       tmuxセッションにアタッチ（省略時はメインワークスペースへ直接アタッチ）
     cd [branch-name]           ローカルのワークスペースディレクトリをtmuxウィンドウで開く（window名: {branch-name}(local)）
 
 ■ ワークスペース管理
@@ -301,7 +309,7 @@ Usage: $0 <command> [options]
 Options:
     --attach, -a               セッション開始後にtmuxセッションに自動アタッチ (upのみ)
     --all                      すべてのセッションを対象にする (downのみ)
-    --rm                       セッション停止後にワークスペースを削除する (downのみ)
+    --rm                       セッション停止後にブランチワークスペースを削除する (downのみ、メインでは無視)
     --tag TAG                  Dockerイメージのタグを指定 (container build/pushのみ)
     --build-arg KEY=VALUE      Dockerビルド引数を指定 (container buildのみ)
     --no-cache                 Dockerビルド時にキャッシュを使用しない (container buildのみ)
@@ -730,6 +738,66 @@ stop_all_sessions() {
 }
 
 # stopコマンド（ブランチ名ベース）
+stop_main_workspace_session() {
+    local remove_workspace_flag="${1:-false}"
+
+    echo "=== vibebox メインワークスペース停止 ==="
+    echo
+
+    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
+        exit 1
+    fi
+
+    if [[ "$remove_workspace_flag" == "true" ]]; then
+        echo "警告: メインワークスペースでは --rm は無視します。リポジトリ本体は削除しません。"
+        echo
+    fi
+
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+    local expected_container_name="vibebox.${git_repo_name}"
+
+    echo "Workspace パス: $PROJECT_ROOT"
+    echo "コンテナ名: $expected_container_name"
+    echo
+
+    if command -v devcontainer &> /dev/null; then
+        echo "devcontainer down を実行中..."
+        if devcontainer_cmd down --workspace-folder "$PROJECT_ROOT" >/dev/null 2>&1; then
+            echo "✓ 停止完了 (devcontainer down)"
+        else
+            echo "警告: devcontainer down に失敗しました。Dockerで停止を試行します。"
+        fi
+    else
+        echo "警告: devcontainer CLIが見つかりません。Dockerで停止を試行します。"
+    fi
+
+    local container_id
+    container_id="$(docker_find_running_container_id_by_name "$expected_container_name" || true)"
+
+    if [[ -z "$container_id" ]]; then
+        echo "メインワークスペースの稼働中コンテナはありません。"
+        return 0
+    fi
+
+    echo "Dockerコンテナを停止中..."
+    if docker_cmd stop "$container_id" >/dev/null 2>&1; then
+        echo "✓ コンテナを停止しました。"
+    else
+        echo "✗ コンテナの停止に失敗しました。" >&2
+        exit 1
+    fi
+
+    echo "Dockerコンテナを削除中..."
+    if docker_cmd rm "$container_id" >/dev/null 2>&1; then
+        echo "✓ コンテナを削除しました。"
+    else
+        echo "✗ コンテナの削除に失敗しました。" >&2
+        exit 1
+    fi
+}
+
 stop_session() {
     local branch_name="$1"
     local remove_workspace_flag="${2:-false}"
@@ -837,7 +905,7 @@ attach_default_devcontainer() {
     container_id="$(docker_find_running_container_id_by_name "$expected_container_name" || true)"
 
     if [[ -z "$container_id" ]]; then
-        echo "エラー: デフォルトdevcontainerが起動していません: $expected_container_name" >&2
+        echo "エラー: メインワークスペースのdevcontainerが起動していません: $expected_container_name" >&2
         echo "'docker ps | grep $expected_container_name' で確認してください。" >&2
         exit 1
     fi
@@ -846,7 +914,7 @@ attach_default_devcontainer() {
     echo "コンテナID: $container_id"
 
     local workspace_folder
-    workspace_folder=$(get_devcontainer_workspace_folder)
+    workspace_folder=$(get_main_container_workspace_folder "$git_repo_name")
 
     local actual_workspace_folder
     if [[ "$workspace_folder" == '\$HOME' ]] || docker_cmd exec "$container_id" test -d "$workspace_folder" 2>/dev/null; then
@@ -873,7 +941,7 @@ attach_session() {
         if [[ -n "$branch_name" ]]; then
             echo "カレントディレクトリから自動取得したブランチ名: $branch_name"
         else
-            # ワークスペース外での無引数実行時はデフォルトdevcontainerに直接アタッチ
+            # ワークスペース外での無引数実行時はメインワークスペースに直接アタッチ
             attach_default_devcontainer
             return
         fi
@@ -1172,6 +1240,150 @@ list_sessions() {
 }
 
 # start-sessionコマンド
+start_main_workspace_session() {
+    local attach_flag="$1"
+
+    echo "=== vibebox メインワークスペースを開始 ==="
+    echo
+
+    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
+        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
+        exit 1
+    fi
+
+    local devcontainer_json="$PROJECT_ROOT/.devcontainer/devcontainer.json"
+    if [[ ! -f "$devcontainer_json" ]]; then
+        echo "エラー: devcontainer.jsonが見つかりません: $devcontainer_json" >&2
+        exit 1
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        echo "エラー: jqがインストールされていません。jqをインストールしてください。" >&2
+        exit 1
+    fi
+
+    if ! command -v devcontainer &> /dev/null; then
+        echo "エラー: devcontainer CLIがインストールされていません。" >&2
+        echo "以下のコマンドでインストールしてください:" >&2
+        echo "  npm install -g @devcontainers/cli" >&2
+        exit 1
+    fi
+
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+    local container_name="vibebox.${git_repo_name}"
+    local container_workspace_folder
+    container_workspace_folder=$(get_main_container_workspace_folder "$git_repo_name")
+
+    echo "Workspace パス: $PROJECT_ROOT"
+    echo "Container workspaceFolder: $container_workspace_folder"
+    echo "コンテナ名: $container_name"
+    echo
+
+    local cleaned_json
+    cleaned_json=$(sed 's://.*$::g; s:/\*.*\*/::g' "$devcontainer_json")
+
+    local override_dir
+    override_dir=$(mktemp -d "${TMPDIR:-/tmp}/vibebox-main-devcontainer.XXXXXX")
+    local override_config="$override_dir/devcontainer.json"
+
+    if ! echo "$cleaned_json" | jq --arg container_name "$container_name" --arg workspace_folder "$container_workspace_folder" '
+        def replace_initialize_hook($container_name):
+            . as $root
+            | ($root.remoteUser // "vibebox") as $remote_user
+            | ("bash .devcontainer/hooks-initialize.sh " + $remote_user + " " + $container_name) as $hook
+            |
+            if ((.initializeCommand // null) | type) == "array"
+               and (.initializeCommand | length) >= 3
+               and .initializeCommand[0] == "bash"
+               and .initializeCommand[1] == "-c" then
+                if (.initializeCommand[2] | contains("hooks-initialize.sh")) then
+                    .initializeCommand[2] = (.initializeCommand[2] | sub("bash \\.devcontainer/hooks-initialize\\.sh [^&]+ && "; $hook + " && "))
+                else
+                    .initializeCommand[2] = ($hook + " && " + .initializeCommand[2])
+                end
+            elif ((.initializeCommand // null) | type) == "string" then
+                if (.initializeCommand | contains("hooks-initialize.sh")) then
+                    .initializeCommand = (.initializeCommand | sub("bash \\.devcontainer/hooks-initialize\\.sh [^&]+ && "; $hook + " && "))
+                else
+                    .initializeCommand = ($hook + " && " + .initializeCommand)
+                end
+            elif .initializeCommand == null then
+                .initializeCommand = ["bash", "-c", $hook]
+            elif ((.initializeCommand // null) | type) == "array" then
+                .initializeCommand = ["bash", "-c", $hook + " && " + (.initializeCommand | join(" "))]
+            else
+                .initializeCommand = ["bash", "-c", $hook + " && " + (.initializeCommand | tostring)]
+            end;
+
+        def strip_env_file_args:
+            reduce .[] as $arg (
+                {skip_next: false, out: []};
+                if .skip_next then
+                    .skip_next = false
+                elif ($arg | test("^--env-file(=|$)")) then
+                    if $arg == "--env-file" then
+                        .skip_next = true
+                    else
+                        .
+                    end
+                else
+                    .out += [$arg]
+                end
+            ) | .out;
+
+        .runArgs = ((.runArgs // []) | strip_env_file_args)
+        |
+        .workspaceFolder = $workspace_folder
+        |
+        .workspaceMount = "source=${localWorkspaceFolder},target=" + $workspace_folder + ",type=bind,consistency=cached"
+        |
+        if (.runArgs | map(test("^--name=")) | any) then
+            .runArgs = (.runArgs | map(
+                if test("^--name=") then
+                    "--name=" + $container_name
+                else
+                    .
+                end
+            ))
+        else
+            .runArgs = .runArgs + ["--name=" + $container_name]
+        end
+        |
+        replace_initialize_hook($container_name)
+    ' > "$override_config"; then
+        rm -rf "$override_dir"
+        echo "エラー: devcontainer override config の生成に失敗しました" >&2
+        exit 1
+    fi
+
+    echo "vibeboxコンテナを起動中..."
+    echo "実行コマンド: $(devcontainer_cmd_prefix) up --override-config $override_config --workspace-folder $PROJECT_ROOT"
+    echo "処理中... (時間がかかる場合があります)"
+    echo
+
+    if devcontainer_cmd up --override-config "$override_config" --workspace-folder "$PROJECT_ROOT"; then
+        echo
+        echo "devcontainerが起動しました"
+    else
+        rm -rf "$override_dir"
+        echo "エラー: devcontainerの起動に失敗しました" >&2
+        exit 1
+    fi
+
+    rm -rf "$override_dir"
+
+    if [[ "$attach_flag" == "true" ]]; then
+        echo
+        echo "メインワークスペースにアタッチします..."
+        attach_default_devcontainer
+    else
+        echo
+        echo "メインワークスペースが開始されました。アタッチするには以下のコマンドを実行してください:"
+        echo "  $0 attach"
+    fi
+}
+
 start_session() {
     local branch_name="$1"
     local attach_flag="$2"
@@ -2777,7 +2989,7 @@ doctor_check() {
                     if [[ -n "$workspace_folder" ]]; then
                         log_check "OK" "  ワークスペースディレクトリ: $workspace_folder"
                     else
-                        log_check "OK" "  ワークスペースディレクトリ: vibebox起動時に /workspace/{repo}.{branch-name} へ設定"
+                        log_check "OK" "  ワークスペースディレクトリ: 無引数時は /workspace/{repo}、ブランチ指定時は /workspace/{repo}.{branch-name} へ設定"
                     fi
 
                     # Dockerイメージチェック
@@ -3280,10 +3492,10 @@ main() {
             done
 
             if [[ -z "$branch_name" ]]; then
-                branch_name="default"
+                start_main_workspace_session "$attach_flag"
+            else
+                start_session "$branch_name" "$attach_flag"
             fi
-
-            start_session "$branch_name" "$attach_flag"
             ;;
         list|ls)
             shift
@@ -3375,9 +3587,10 @@ main() {
                 stop_all_sessions "$remove_workspace"
             else
                 if [[ -z "$branch_name" ]]; then
-                    branch_name="default"
+                    stop_main_workspace_session "$remove_workspace"
+                else
+                    stop_session "$branch_name" "$remove_workspace"
                 fi
-                stop_session "$branch_name" "$remove_workspace"
             fi
             ;;
         shell)
