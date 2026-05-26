@@ -6,7 +6,7 @@ set -e  # エラーが発生したら即座に終了
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     PROJECT_ROOT="$(git rev-parse --show-toplevel)"
 else
-    PROJECT_ROOT="$(dirname "${BASH_SOURCE[0]}")"
+    PROJECT_ROOT="$(pwd)"
 fi
 
 # 現在のディレクトリ名を取得してイメージ名を構築
@@ -279,6 +279,7 @@ Usage: $0 <command> [options]
     list | ls                  ワークスペース一覧を表示（ws ls のエイリアス）
     up [branch-name] [--attach|-a]
                                vibeboxコンテナセッションを開始
+                               起動後は自動でtmuxセッションにアタッチ
                                省略時: メインワークスペースを /workspace/{repo} で起動（ワークスペース作成なし）
                                branch-name指定時: .vibebox-workspaces配下を /workspace/{repo}.{branch-name} で起動
     down [branch-name] [--rm]
@@ -307,7 +308,7 @@ Usage: $0 <command> [options]
     secrets set               envchainを使ってAWSシークレットを設定
 
 Options:
-    --attach, -a               セッション開始後にtmuxセッションに自動アタッチ (upのみ)
+    --attach, -a               互換性のため受け付けます（upは常に自動アタッチ）
     --all                      すべてのセッションを対象にする (downのみ)
     --rm                       セッション停止後にブランチワークスペースを削除する (downのみ、メインでは無視)
     --tag TAG                  Dockerイメージのタグを指定 (container build/pushのみ)
@@ -744,11 +745,6 @@ stop_main_workspace_session() {
     echo "=== vibebox メインワークスペース停止 ==="
     echo
 
-    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
-        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
-        exit 1
-    fi
-
     if [[ "$remove_workspace_flag" == "true" ]]; then
         echo "警告: メインワークスペースでは --rm は無視します。リポジトリ本体は削除しません。"
         echo
@@ -816,12 +812,6 @@ stop_session() {
     echo "=== vibebox セッション停止 ==="
     echo "ブランチ: $branch_name"
     echo
-
-    # gitリポジトリかどうかチェック
-    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
-        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
-        exit 1
-    fi
 
     # ワークスペースパスを構築
     local workspace_path="$PROJECT_ROOT/.vibebox-workspaces/$branch_name"
@@ -891,11 +881,7 @@ stop_session() {
 
 # attachコマンド（ブランチ名ベース）
 attach_default_devcontainer() {
-    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
-        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
-        exit 1
-    fi
-
+    local attach_mode="${1:-direct}"
     local git_repo_name
     git_repo_name=$(basename "$PROJECT_ROOT")
 
@@ -924,10 +910,57 @@ attach_default_devcontainer() {
         actual_workspace_folder='\$HOME'
     fi
 
-    if [[ "$actual_workspace_folder" == '\$HOME' ]]; then
-        docker_cmd exec -e TERM=xterm-256color -e COLORTERM=truecolor -it "$container_id" bash -c 'cd $HOME && exec $SHELL'
+    if [[ "$attach_mode" != "tmux" ]]; then
+        if [[ "$actual_workspace_folder" == '\$HOME' ]]; then
+            docker_cmd exec -e TERM=xterm-256color -e COLORTERM=truecolor -e DOTENV_PRIVATE_KEY=$DOTENV_PRIVATE_KEY -it "$container_id" bash -c 'cd $HOME && exec $SHELL'
+        else
+            docker_cmd exec -e TERM=xterm-256color -e COLORTERM=truecolor -e DOTENV_PRIVATE_KEY=$DOTENV_PRIVATE_KEY -it "$container_id" bash -c "cd $actual_workspace_folder && exec \$SHELL"
+        fi
+        return
+    fi
+
+    local tmux_session="${git_repo_name//[.\/-]/_}/vibebox"
+    local tmux_window="main"
+
+    if ! command -v tmux &> /dev/null; then
+        echo "エラー: tmuxがインストールされていません。" >&2
+        echo "tmuxをインストールしてから再度実行してください。" >&2
+        exit 1
+    fi
+
+    local window_created="false"
+    if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+        echo "tmuxセッションを作成します: $tmux_session"
+        tmux new-session -d -s "$tmux_session" -n "console" -c "$PROJECT_ROOT"
+    fi
+
+    if tmux list-windows -t "$tmux_session" -F "#{window_name}" | grep -Fxq "$tmux_window"; then
+        echo "既存のtmuxウィンドウを使用します: $tmux_session:$tmux_window"
     else
-        docker_cmd exec -e TERM=xterm-256color -e COLORTERM=truecolor -it "$container_id" bash -c "cd $actual_workspace_folder && exec \$SHELL"
+        echo "tmuxウィンドウを作成します: $tmux_session:$tmux_window"
+        tmux new-window -t "$tmux_session" -n "$tmux_window" -c "$PROJECT_ROOT"
+        window_created="true"
+    fi
+
+    if [[ "$window_created" == "true" ]]; then
+        local docker_exec_cmd
+        if [[ "$actual_workspace_folder" == '\$HOME' ]]; then
+            docker_exec_cmd="$(docker_cmd_prefix) exec -e TERM=xterm-256color -e COLORTERM=truecolor -it \"$container_id\" bash -c 'cd \$HOME && exec \$SHELL'"
+        else
+            docker_exec_cmd="$(docker_cmd_prefix) exec -e TERM=xterm-256color -e COLORTERM=truecolor -it \"$container_id\" bash -c \"cd $actual_workspace_folder && exec \\\$SHELL\""
+        fi
+        tmux send-keys -t "$tmux_session:$tmux_window" "$docker_exec_cmd" Enter
+    fi
+
+    echo "tmuxセッション: $tmux_session"
+    echo "tmuxウィンドウ: $tmux_window"
+    echo "アタッチします..."
+    echo
+
+    if [[ -n "$TMUX" ]]; then
+        tmux switch-client -t "$tmux_session:$tmux_window"
+    else
+        tmux attach-session -t "$tmux_session:$tmux_window"
     fi
 }
 
@@ -941,7 +974,7 @@ attach_session() {
         if [[ -n "$branch_name" ]]; then
             echo "カレントディレクトリから自動取得したブランチ名: $branch_name"
         else
-            # ワークスペース外での無引数実行時はメインワークスペースに直接アタッチ
+            # ワークスペース外での無引数実行時はメインワークスペースにアタッチ
             attach_default_devcontainer
             return
         fi
@@ -949,12 +982,6 @@ attach_session() {
 
     echo "=== vivebox セッションにアタッチ ==="
     echo "ブランチ: $branch_name"
-
-    # gitリポジトリかどうかチェック
-    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
-        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
-        exit 1
-    fi
 
     # tmuxセッション名を構築
     local git_repo_name
@@ -1006,27 +1033,38 @@ attach_session() {
 
 # list-workspaceコマンド
 list_workspaces() {
-    echo "=== .vibebox-workspaces ワークスペース一覧 ==="
+    echo "=== vibebox ワークスペース一覧 ==="
     echo
 
-    # gitリポジトリかどうかチェック
-    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
-        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
-        exit 1
-    fi
-
     local vibebox_dir="$PROJECT_ROOT/.vibebox-workspaces"
+    local git_repo_name
+    git_repo_name=$(basename "$PROJECT_ROOT")
+    local main_container_name="vibebox.${git_repo_name}"
+    local main_container_id
+    main_container_id="$(docker_find_running_container_id_by_name "$main_container_name" || true)"
+
+    echo "メインワークスペース:"
+    echo "  パス: $PROJECT_ROOT"
+    echo "  コンテナ名: $main_container_name"
+    if [[ -n "$main_container_id" ]]; then
+        echo "  状態: 稼働中 ($main_container_id)"
+    else
+        echo "  状態: 停止中"
+    fi
+    echo
 
     # vibebox-workspacesディレクトリが存在するかチェック
     if [[ ! -d "$vibebox_dir" ]]; then
-        echo "ワークスペースディレクトリが存在しません: $vibebox_dir"
+        echo "ブランチワークスペース: なし"
         echo
-        echo "ワークスペースを作成するには:"
-        echo "  $0 up [branch-name]"
+        echo "コマンド:"
+        echo "  メイン開始: $0 up"
+        echo "  メイン接続: $0 attach"
+        echo "  メイン停止: $0 down"
         return 0
     fi
 
-    echo "ワークスペースディレクトリ: $vibebox_dir"
+    echo "ブランチワークスペースディレクトリ: $vibebox_dir"
     echo
 
     # ワークスペース一覧を取得
@@ -1043,21 +1081,19 @@ list_workspaces() {
     done
 
     if [[ $workspace_count -eq 0 ]]; then
-        echo "ワークスペースが見つかりませんでした。"
+        echo "ブランチワークスペース: なし"
         echo
-        echo "ワークスペースを作成するには:"
-        echo "  $0 up [branch-name]"
+        echo "コマンド:"
+        echo "  メイン開始: $0 up"
+        echo "  メイン接続: $0 attach"
+        echo "  メイン停止: $0 down"
         return 0
     fi
 
-    echo "総ワークスペース数: $workspace_count"
+    echo "ブランチワークスペース数: $workspace_count"
     echo
-    echo "ワークスペース一覧:"
+    echo "ブランチワークスペース一覧:"
     echo "────────────────────────────────────────────────────────────"
-
-    # gitリポジトリ名を取得（コンテナ状態チェック用）
-    local git_repo_name
-    git_repo_name=$(basename "$PROJECT_ROOT")
 
     # ワークスペースを一覧表示
     for branch_name in "${workspaces[@]}"; do
@@ -1246,11 +1282,6 @@ start_main_workspace_session() {
     echo "=== vibebox メインワークスペースを開始 ==="
     echo
 
-    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
-        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
-        exit 1
-    fi
-
     local devcontainer_json="$PROJECT_ROOT/.devcontainer/devcontainer.json"
     if [[ ! -f "$devcontainer_json" ]]; then
         echo "エラー: devcontainer.jsonが見つかりません: $devcontainer_json" >&2
@@ -1376,7 +1407,7 @@ start_main_workspace_session() {
     if [[ "$attach_flag" == "true" ]]; then
         echo
         echo "メインワークスペースにアタッチします..."
-        attach_default_devcontainer
+        attach_default_devcontainer "tmux"
     else
         echo
         echo "メインワークスペースが開始されました。アタッチするには以下のコマンドを実行してください:"
@@ -1392,9 +1423,8 @@ start_session() {
     echo "ブランチ: $branch_name"
     echo
 
-    # gitリポジトリかどうかチェック
-    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
-        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
+    if ! git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "エラー: ブランチ名を指定した up はgitリポジトリ内で実行してください" >&2
         exit 1
     fi
 
@@ -1800,7 +1830,7 @@ start_session() {
         if tmux list-windows -t "$tmux_session" -F "#{window_name}" | grep -q "^${tmux_window}$"; then
             echo "既存のtmuxウィンドウが見つかりました: $tmux_session:$tmux_window"
 
-            # --attachフラグが設定されている場合のみアタッチ
+            # upはデフォルトで既存ウィンドウにアタッチする（--attach/-aは互換オプション）
             if [[ "$attach_flag" == "true" ]]; then
                 echo "既存のtmuxウィンドウにアタッチします..."
                 # 既にtmux内にいる場合
@@ -1845,7 +1875,7 @@ start_session() {
     # tmuxウィンドウでDockerコマンドを実行
     tmux send-keys -t "$tmux_session:$tmux_window" "$docker_exec_cmd" Enter
 
-    # --attachフラグが設定されている場合のみtmuxセッションにアタッチ
+    # upはデフォルトでtmuxセッションにアタッチする（--attach/-aは互換オプション）
     if [[ "$attach_flag" == "true" ]]; then
         echo "tmuxセッションにアタッチしています..."
         if [[ -n "$TMUX" ]]; then
@@ -1867,11 +1897,10 @@ shell_session() {
 
     # ブランチ名が省略された場合、カレントディレクトリから自動取得を試行
     if [[ -z "$branch_name" ]]; then
-        branch_name=$(get_current_branch_name)
+        branch_name=$(get_current_branch_name || true)
         if [[ -z "$branch_name" ]]; then
-            echo "エラー: ブランチ名が指定されておらず、カレントディレクトリからも自動取得できませんでした" >&2
-            echo "ワークスペースディレクトリ内で実行するか、ブランチ名を明示的に指定してください" >&2
-            exit 1
+            attach_default_devcontainer
+            return
         fi
         echo "カレントディレクトリから自動取得したブランチ名: $branch_name"
     fi
@@ -1879,12 +1908,6 @@ shell_session() {
     echo "=== vibebox のシェルを起動 ==="
     echo "ブランチ: $branch_name"
     echo
-
-    # gitリポジトリかどうかチェック
-    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
-        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
-        exit 1
-    fi
 
     # gitリポジトリ名を取得
     local git_repo_name
@@ -1954,12 +1977,6 @@ edit_session() {
     echo "ブランチ: $branch_name"
     echo
 
-    # gitリポジトリかどうかチェック
-    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
-        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
-        exit 1
-    fi
-
     # ワークスペースパスを構築
     local workspace_path="$PROJECT_ROOT/.vibebox-workspaces/$branch_name"
 
@@ -2006,11 +2023,6 @@ cd_local_session() {
     echo "=== ローカルワークスペースをtmuxで開く ==="
     echo "ブランチ: $branch_name"
     echo
-
-    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
-        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
-        exit 1
-    fi
 
     local workspace_path="$PROJECT_ROOT/.vibebox-workspaces/$branch_name"
     if [[ ! -d "$workspace_path" ]]; then
@@ -2107,11 +2119,6 @@ init_vibebox() {
     fi
 
     # 必要なテンプレートファイルの存在確認
-    if [[ ! -f "$template_dir/claude-pty" ]]; then
-        echo "エラー: claude-ptyテンプレートが見つかりません: $template_dir/claude-pty" >&2
-        exit 1
-    fi
-
     if [[ ! -f "$template_dir/Dockerfile.template" ]]; then
         echo "エラー: Dockerfile.templateが見つかりません: $template_dir/Dockerfile.template" >&2
         exit 1
@@ -2136,24 +2143,19 @@ init_vibebox() {
     echo "ディレクトリを作成: $target_vibebox_dir"
     mkdir -p "$target_vibebox_dir"
 
-    # claude-ptyをコピー
-    echo "ファイルをコピー: claude-pty"
-    cp "$template_dir/claude-pty" "$target_vibebox_dir/claude-pty"
-    chmod +x "$target_vibebox_dir/claude-pty"
-
     # BASE_IMAGEの入力を求める
     echo
     echo "ベースイメージを指定してください。"
     echo "例:"
-    echo "  - ubuntu:22.04"
-    echo "  - python:3.11-slim"
-    echo "  - node:20-alpine"
+    echo "  - ubuntu:26.04"
+    echo "  - python:3.14-slim"
+    echo "  - node:24-bookworm"
     echo
-    read -p "BASE_IMAGE [ubuntu:22.04]: " base_image
+    read -p "BASE_IMAGE [ubuntu:26.04]: " base_image
 
     # デフォルト値の設定
     if [[ -z "$base_image" ]]; then
-        base_image="ubuntu:22.04"
+        base_image="ubuntu:26.04"
     fi
 
     echo
@@ -2660,12 +2662,6 @@ cleanup_worktrees() {
     echo "=== vibeboxコンテナとワークスペースを削除 ==="
     echo
 
-    # gitリポジトリかどうかチェック
-    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
-        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
-        exit 1
-    fi
-
     local vibebox_dir="$PROJECT_ROOT/.vibebox-workspaces"
 
     # vibebox-workspacesディレクトリが存在するかチェック
@@ -2791,12 +2787,6 @@ remove_workspace() {
             exit 1
         fi
         echo "カレントディレクトリから自動取得したブランチ名: $branch_name"
-    fi
-
-    # gitリポジトリかどうかチェック
-    if [[ ! -d "$PROJECT_ROOT/.git" ]]; then
-        echo "エラー: プロジェクトルートがgitリポジトリではありません" >&2
-        exit 1
     fi
 
     local workspace_path="$PROJECT_ROOT/.vibebox-workspaces/$branch_name"
@@ -3464,7 +3454,7 @@ main() {
         up|open)
             shift
             local branch_name=""
-            local attach_flag="false"
+            local attach_flag="true"
 
             # 最初の引数がブランチ名
             if [[ $# -gt 0 && "$1" != --* ]]; then

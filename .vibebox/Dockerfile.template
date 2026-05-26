@@ -84,7 +84,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
 
 # Node.jsのインストール（既に存在する場合はスキップ）
 RUN if ! command -v node >/dev/null 2>&1 && ! command -v nodejs >/dev/null 2>&1; then \
-    NODE_VERSION=22.15.0 \
+    NODE_VERSION=24.15.0 \
     && ARCH= && dpkgArch="$(dpkg --print-architecture)" \
     && case "${dpkgArch##*-}" in \
       amd64) ARCH='x64';; \
@@ -100,6 +100,7 @@ RUN if ! command -v node >/dev/null 2>&1 && ! command -v nodejs >/dev/null 2>&1;
     # gpg keys listed at https://github.com/nodejs/node#release-keys
     && set -ex \
     && for key in \
+      5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 \
       C0D6248439F1D5604AAFFB4021D900FFDB233756 \
       DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7 \
       CC68F5A3106FF448322E48ED27F5E38D5B0A215F \
@@ -149,16 +150,12 @@ RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/
   -a "export PROMPT_COMMAND='history -a' && export HISTFILE=/home/$USERNAME/commandhistory/.bash_history" \
   -x
 
-# * Install Claude * -------------------------------------------------------------------------------------------------------------
-USER root
-COPY ./claude-pty /usr/local/bin/claude-pty
-RUN chmod +x /usr/local/bin/claude-pty
-RUN chown $USERNAME:$USERNAME /usr/local/bin/claude-pty
+# * Install Coding Agents * -------------------------------------------------------------------------------------------------------------
 USER $USERNAME
 # npmが利用できない場合は、rootユーザーでNode.jsをインストールしてからnpmパッケージをインストール
 RUN if ! command -v npm >/dev/null 2>&1; then \
     echo "npm is not available, installing Node.js..." \
-    && sudo bash -c 'NODE_VERSION=22.15.0 \
+    && sudo bash -c 'NODE_VERSION=24.15.0 \
     && ARCH= && dpkgArch="$(dpkg --print-architecture)" \
     && case "${dpkgArch##*-}" in \
       amd64) ARCH="x64";; \
@@ -171,6 +168,7 @@ RUN if ! command -v npm >/dev/null 2>&1; then \
     esac \
     && export GNUPGHOME="$(mktemp -d)" \
     && for key in \
+      5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 \
       C0D6248439F1D5604AAFFB4021D900FFDB233756 \
       DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7 \
       CC68F5A3106FF448322E48ED27F5E38D5B0A215F \
@@ -194,7 +192,9 @@ RUN if ! command -v npm >/dev/null 2>&1; then \
     && ln -s /usr/local/bin/node /usr/local/bin/nodejs'; \
   fi \
   && npm install -g @anthropic-ai/claude-code \
-  && npm install -g @openai/codex@latest
+  && npm install -g @openai/codex@latest \
+  && npm install -g opencode-ai \
+  && curl https://cursor.com/install -fsS | bash
 
 # * Setup GitHub CLI * -------------------------------------------------------------------------------------------------------------
 USER root
